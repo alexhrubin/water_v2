@@ -1,6 +1,7 @@
 module WaveTank
 
 using LinearAlgebra
+using SparseArrays
 using Printf
 
 export Tank, Actuator, WaveSim, Propagator
@@ -142,32 +143,20 @@ function evaluate_modal_amplitudes(prop::Propagator, T::Real)
     (; tank, actuators, dt) = sim
     γ = tank.damping
 
-    n_act = length(actuators)
     n_steps = length(t_grid)
-    n_modes = length(ω)
 
-    # Sample actuator signals: Q[i, k]
-    Q = zeros(n_act, n_steps)
-    for i in 1:n_act
-        for k in 1:n_steps
-            Q[i, k] = actuators[i].forcing(t_grid[k])
-        end
-    end
+    # Sample actuator signals: Q[n_act × n_steps] — broadcast per actuator
+    Q = reduce(vcat, [act.forcing.(t_grid)' for act in actuators])
 
     # Modal forcing: F = C · Q  → [n_modes × n_steps]
     F = C * Q
 
-    # Temporal convolution per mode: a_j = Σ_k g_j(T - t_k) · F[j,k] · Δt
-    a = zeros(n_modes)
-    for j in 1:n_modes
-        s = 0.0
-        for k in 1:n_steps
-            τ = T - t_grid[k]
-            τ <= 0 && continue
-            s += green_kernel(ω[j], ω_d[j], γ, τ) * F[j, k]
-        end
-        a[j] = s * dt
-    end
+    # Vectorised temporal convolution via Green's kernel matrix
+    τ_vec = T .- t_grid                                            # [n_steps]
+    mask = τ_vec .> 0                                              # [n_steps] Bool
+    G = (exp.((-γ) .* ω .* τ_vec') .* sin.(ω_d .* τ_vec') ./ ω_d) .* mask'
+    #    [n_modes × n_steps]
+    a = sum(G .* F, dims=2)[:] .* dt                               # [n_modes]
 
     return a
 end
@@ -195,10 +184,10 @@ function caustic_image(prop::Propagator, T::Real;
 
     a = evaluate_modal_amplitudes(prop, T)
 
-    # Surface height and analytic gradients
-    η_flat = Φ' * a
-    dη_dx_flat = dΦ_dx' * a
-    dη_dy_flat = dΦ_dy' * a
+    # Surface height and analytic gradients → reshaped to [nx, ny]
+    η     = reshape(Φ' * a,      nx, ny)
+    dηdx  = reshape(dΦ_dx' * a,  nx, ny)
+    dηdy  = reshape(dΦ_dy' * a,  nx, ny)
 
     # Default sigma: 1.5 × max grid spacing
     dx = xs[2] - xs[1]
@@ -207,40 +196,54 @@ function caustic_image(prop::Propagator, T::Real;
 
     σ2 = σ * σ
     inv_2σ2 = 1.0 / (2.0 * σ2)
-    window = ceil(Int, cutoff_sigmas * σ / max(dx, dy))
+    w = ceil(Int, cutoff_sigmas * σ / max(dx, dy))
 
     ratio = 1.0 / n_water
 
-    I = zeros(nx, ny)
+    # Phase A — Landing positions (pure broadcast)
+    X_src = repeat(xs, 1, ny)           # [nx, ny]
+    Y_src = repeat(ys', nx, 1)          # [nx, ny]
 
-    # For each grid point (ray source), compute refracted landing and splat
-    idx = 0
-    for iy in 1:ny, ix in 1:nx
-        idx += 1
-        η_val = η_flat[idx]
-        dηdx = dη_dx_flat[idx]
-        dηdy = dη_dy_flat[idx]
+    x_land = X_src .+ (depth .- η) .* dηdx .* ratio
+    y_land = Y_src .+ (depth .- η) .* dηdy .* ratio
 
-        # Landing position of refracted ray on tank bottom
-        x_land = xs[ix] + (depth - η_val) * dηdx * ratio
-        y_land = ys[iy] + (depth - η_val) * dηdy * ratio
+    # Phase B — Bilinear splatting via sparse() (no mutation)
+    n_pix = nx * ny
+    fi = clamp.((x_land .- xs[1]) ./ dx .+ 1.0, 1.0, Float64(nx))
+    fj = clamp.((y_land .- ys[1]) ./ dy .+ 1.0, 1.0, Float64(ny))
 
-        # Convert landing to fractional grid indices
-        fx = (x_land - xs[1]) / dx + 1.0
-        fy = (y_land - ys[1]) / dy + 1.0
+    ix0 = clamp.(floor.(Int, fi), 1, nx - 1)
+    iy0 = clamp.(floor.(Int, fj), 1, ny - 1)
+    wx  = fi .- ix0
+    wy  = fj .- iy0
 
-        # Splatting window bounds (clamped to grid)
-        ix_min = max(1, floor(Int, fx) - window)
-        ix_max = min(nx, ceil(Int, fx) + window)
-        iy_min = max(1, floor(Int, fy) - window)
-        iy_max = min(ny, ceil(Int, fy) + window)
+    # Linear indices for the 4 bilinear corners (column-major: row = ix, col = iy)
+    lin00 = ix0      .+ (iy0 .- 1) .* nx
+    lin10 = (ix0.+1) .+ (iy0 .- 1) .* nx
+    lin01 = ix0      .+ iy0        .* nx
+    lin11 = (ix0.+1) .+ iy0        .* nx
 
-        for jy in iy_min:iy_max, jx in ix_min:ix_max
-            dist2 = (xs[jx] - x_land)^2 + (ys[jy] - y_land)^2
-            w = exp(-dist2 * inv_2σ2)
-            I[jx, jy] += w
-        end
-    end
+    w00 = (1.0 .- wx) .* (1.0 .- wy)
+    w10 = wx           .* (1.0 .- wy)
+    w01 = (1.0 .- wx) .* wy
+    w11 = wx           .* wy
+
+    row_idx = vcat(vec(lin00), vec(lin10), vec(lin01), vec(lin11))
+    vals    = vcat(vec(w00),   vec(w10),   vec(w01),   vec(w11))
+    col_idx = ones(Int, 4 * n_pix)
+
+    D = reshape(Array(sparse(row_idx, col_idx, vals, n_pix, 1))[:], nx, ny)
+
+    # Phase C — Gaussian convolution without mutation
+    D_pad = vcat(zeros(w, ny + 2w),
+                 hcat(zeros(nx, w), D, zeros(nx, w)),
+                 zeros(w, ny + 2w))
+
+    I = sum(
+        exp(-((di * dx)^2 + (dj * dy)^2) * inv_2σ2) .*
+            D_pad[w+1+di:w+nx+di, w+1+dj:w+ny+dj]
+        for di in -w:w, dj in -w:w
+    )
 
     return xs, ys, I
 end
@@ -308,13 +311,17 @@ function visualize_caustic(prop::Propagator;
     # Pre-sample to auto-determine clims if not provided
     if clims === nothing
         sample_times = range(t0 + 0.1, t1, length=min(10, length(frames)))
-        maxval = 0.0
+        all_vals = Float64[]
         for t in sample_times
             _, _, I = caustic_image(prop, t; n_water=n_water, sigma=sigma)
-            maxval = max(maxval, maximum(I))
+            append!(all_vals, vec(I))
         end
-        maxval = max(maxval, 1e-10)
-        clims = (0.0, maxval)
+        sort!(all_vals)
+        # Use 99.5th percentile so caustic lines are visible without
+        # rare extreme peaks washing the colormap to black
+        hi = all_vals[max(1, round(Int, 0.995 * length(all_vals)))]
+        lo = all_vals[max(1, round(Int, 0.005 * length(all_vals)))]
+        clims = (lo, max(hi, lo + 1e-10))
     end
 
     anim = plt.Animation()
