@@ -3,10 +3,12 @@ module WaveTank
 using LinearAlgebra
 using SparseArrays
 using Printf
+using Zygote
 
-export Tank, Actuator, WaveSim, Propagator
+export Tank, Actuator, SineSum, WaveSim, Propagator
 export build_propagator, evaluate_surface, visualize
-export evaluate_modal_amplitudes, caustic_image, visualize_caustic
+export evaluate_modal_amplitudes, caustic_image, caustic_loss, visualize_caustic
+export params_to_Q, pack_params, unpack_params, make_caustic_loss
 
 # ── Data structures ──────────────────────────────────────────────────
 
@@ -19,17 +21,70 @@ struct Tank
 end
 Tank(Lx, Ly, depth; g=9.81, damping=0.01) = Tank(Lx, Ly, depth, g, damping)
 
-struct Actuator
+struct SineSum
+    A::Vector{Float64}      # amplitudes
+    ω::Vector{Float64}      # angular frequencies
+    φ::Vector{Float64}      # phases
+end
+(s::SineSum)(t) = sum(s.A[n] * sin(s.ω[n] * t + s.φ[n]) for n in eachindex(s.A))
+SineSum(; freqs, A, φ=zeros(length(A))) = SineSum(A, 2π .* freqs, φ)
+
+# ── Parameter helpers for AD ─────────────────────────────────────────
+
+"""
+    params_to_Q(A_mat, φ_mat, ω_freqs, t_grid)
+
+Pure broadcast computation of actuator signals from Fourier coefficients.
+- `A_mat` [n_act × n_freq], `φ_mat` [n_act × n_freq] — differentiable
+- `ω_freqs` [n_freq], `t_grid` [n_steps] — fixed constants
+Returns `Q` [n_act × n_steps] where Q[i,k] = Σ_n A[i,n] * sin(ω[n]*t[k] + φ[i,n])
+"""
+function params_to_Q(A_mat::AbstractMatrix, φ_mat::AbstractMatrix,
+                     ω_freqs::AbstractVector, t_grid::AbstractVector)
+    # A_mat:  [n_act × n_freq]
+    # φ_mat:  [n_act × n_freq]
+    # ω_freqs: [n_freq]
+    # t_grid:  [n_steps]
+    # 3D broadcast: phases[n_act, n_freq, n_steps] = ω[1,n,1]*t[1,1,k] + φ[i,n,1]
+    n_act, n_freq = size(A_mat)
+    n_steps = length(t_grid)
+    ω_3d = reshape(ω_freqs, 1, n_freq, 1)        # [1, n_freq, 1]
+    t_3d = reshape(t_grid, 1, 1, n_steps)          # [1, 1, n_steps]
+    A_3d = reshape(A_mat, n_act, n_freq, 1)        # [n_act, n_freq, 1]
+    φ_3d = reshape(φ_mat, n_act, n_freq, 1)        # [n_act, n_freq, 1]
+    # sin_vals: [n_act, n_freq, n_steps]
+    sin_vals = sin.(ω_3d .* t_3d .+ φ_3d)
+    # weighted sum over freq dim → [n_act, 1, n_steps] → reshape to [n_act, n_steps]
+    Q = dropdims(sum(A_3d .* sin_vals, dims=2), dims=2)
+    return Q
+end
+
+"""
+    pack_params(A_mat, φ_mat) → flat vector [vec(A); vec(φ)]
+"""
+pack_params(A_mat::AbstractMatrix, φ_mat::AbstractMatrix) = vcat(vec(A_mat), vec(φ_mat))
+
+"""
+    unpack_params(params, n_act, n_freq) → (A_mat, φ_mat)
+"""
+function unpack_params(params::AbstractVector, n_act::Int, n_freq::Int)
+    n = n_act * n_freq
+    A_mat = reshape(params[1:n], n_act, n_freq)
+    φ_mat = reshape(params[n+1:2n], n_act, n_freq)
+    return A_mat, φ_mat
+end
+
+struct Actuator{F}
     x::Float64
     y::Float64
-    forcing::Function  # t → amplitude
-    width::Float64     # Gaussian half-width σ (0 = point source)
+    forcing::F             # t → amplitude (any callable)
+    width::Float64         # Gaussian half-width σ (0 = point source)
 end
 Actuator(x, y, forcing; width=0.0) = Actuator(x, y, forcing, width)
 
-struct WaveSim
+struct WaveSim{A<:Vector{<:Actuator}}
     tank::Tank
-    actuators::Vector{Actuator}
+    actuators::A
     tspan::Tuple{Float64,Float64}
     dt::Float64
     n_modes::Int  # per direction
@@ -166,7 +221,32 @@ function evaluate_modal_amplitudes(prop::Propagator, T::Real)
     mask = τ_vec .> 0                                              # [n_steps] Bool
     G = (exp.((-γ) .* ω .* τ_vec') .* sin.(ω_d .* τ_vec') ./ ω_d) .* mask'
     #    [n_modes × n_steps]
-    a = sum(G .* F, dims=2)[:] .* dt                               # [n_modes]
+    a = vec(sum(G .* F, dims=2)) .* dt                             # [n_modes]
+
+    return a
+end
+
+"""
+    evaluate_modal_amplitudes(prop, T, Q)
+
+Like `evaluate_modal_amplitudes(prop, T)` but takes pre-computed actuator
+signal matrix `Q` [n_act × n_steps] instead of sampling from actuators.
+This method is Zygote-differentiable w.r.t. `Q`.
+"""
+function evaluate_modal_amplitudes(prop::Propagator, T::Real, Q::AbstractMatrix)
+    (; C, ω, ω_d, t_grid) = prop
+    γ = prop.sim.tank.damping
+    dt = prop.sim.dt
+
+    # Modal forcing: F = C · Q  → [n_modes × n_steps]
+    F = C * Q
+
+    # Vectorised temporal convolution via Green's kernel matrix
+    τ_vec = T .- t_grid                                            # [n_steps]
+    mask = τ_vec .> 0                                              # [n_steps] Bool
+    G = (exp.((-γ) .* ω .* τ_vec') .* sin.(ω_d .* τ_vec') ./ ω_d) .* mask'
+    #    [n_modes × n_steps]
+    a = vec(sum(G .* F, dims=2)) .* dt                             # [n_modes]
 
     return a
 end
@@ -185,14 +265,40 @@ function evaluate_surface(prop::Propagator, T::Real)
     return xs, ys, η
 end
 
+# ── AD utilities ─────────────────────────────────────────────────────
+
+function scatter_add(vals::AbstractVector, indices::AbstractVector{<:Integer}, n::Int)
+    dst = zeros(eltype(vals), n)
+    for k in eachindex(vals)
+        dst[indices[k]] += vals[k]
+    end
+    return dst
+end
+
+Zygote.@adjoint function scatter_add(vals, indices, n)
+    dst = scatter_add(vals, indices, n)
+    back(Δ) = (Δ[indices], nothing, nothing)
+    return dst, back
+end
+
 # ── Caustic rendering ───────────────────────────────────────────────
 
 function caustic_image(prop::Propagator, T::Real;
                        n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
+    a = evaluate_modal_amplitudes(prop, T)
+    return caustic_image(prop, a; n_water=n_water, sigma=sigma, cutoff_sigmas=cutoff_sigmas)
+end
+
+"""
+    caustic_image(prop, a; n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
+
+Render caustic image from pre-computed modal amplitudes `a`.
+This method is Zygote-differentiable w.r.t. `a`.
+"""
+function caustic_image(prop::Propagator, a::AbstractVector;
+                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
     (; sim, Φ, dΦ_dx, dΦ_dy, xs, ys, nx, ny) = prop
     depth = sim.tank.depth
-
-    a = evaluate_modal_amplitudes(prop, T)
 
     # Surface height and analytic gradients → reshaped to [nx, ny]
     η     = reshape(Φ' * a,      nx, ny)
@@ -206,7 +312,10 @@ function caustic_image(prop::Propagator, T::Real;
 
     σ2 = σ * σ
     inv_2σ2 = 1.0 / (2.0 * σ2)
-    w = ceil(Int, cutoff_sigmas * σ / max(dx, dy))
+
+    w = Zygote.ignore() do
+        ceil(Int, cutoff_sigmas * σ / max(dx, dy))
+    end
 
     ratio = 1.0 / n_water
 
@@ -217,32 +326,33 @@ function caustic_image(prop::Propagator, T::Real;
     x_land = X_src .+ (depth .- η) .* dηdx .* ratio
     y_land = Y_src .+ (depth .- η) .* dηdy .* ratio
 
-    # Phase B — Bilinear splatting via sparse() (no mutation)
+    # Phase B — Bilinear splatting via scatter_add (Zygote-compatible)
     n_pix = nx * ny
     fi = clamp.((x_land .- xs[1]) ./ dx .+ 1.0, 1.0, Float64(nx))
     fj = clamp.((y_land .- ys[1]) ./ dy .+ 1.0, 1.0, Float64(ny))
 
-    ix0 = clamp.(floor.(Int, fi), 1, nx - 1)
-    iy0 = clamp.(floor.(Int, fj), 1, ny - 1)
-    wx  = fi .- ix0
-    wy  = fj .- iy0
+    # Integer indices — no gradient needed
+    ix0, iy0, lin00, lin10, lin01, lin11 = Zygote.ignore() do
+        ix0_ = clamp.(floor.(Int, fi), 1, nx - 1)
+        iy0_ = clamp.(floor.(Int, fj), 1, ny - 1)
+        lin00_ = ix0_      .+ (iy0_ .- 1) .* nx
+        lin10_ = (ix0_.+1) .+ (iy0_ .- 1) .* nx
+        lin01_ = ix0_      .+ iy0_        .* nx
+        lin11_ = (ix0_.+1) .+ iy0_        .* nx
+        (ix0_, iy0_, lin00_, lin10_, lin01_, lin11_)
+    end
 
-    # Linear indices for the 4 bilinear corners (column-major: row = ix, col = iy)
-    lin00 = ix0      .+ (iy0 .- 1) .* nx
-    lin10 = (ix0.+1) .+ (iy0 .- 1) .* nx
-    lin01 = ix0      .+ iy0        .* nx
-    lin11 = (ix0.+1) .+ iy0        .* nx
+    wx = fi .- Float64.(ix0)
+    wy = fj .- Float64.(iy0)
 
     w00 = (1.0 .- wx) .* (1.0 .- wy)
     w10 = wx           .* (1.0 .- wy)
     w01 = (1.0 .- wx) .* wy
     w11 = wx           .* wy
 
-    row_idx = vcat(vec(lin00), vec(lin10), vec(lin01), vec(lin11))
-    vals    = vcat(vec(w00),   vec(w10),   vec(w01),   vec(w11))
-    col_idx = ones(Int, 4 * n_pix)
-
-    D = reshape(Array(sparse(row_idx, col_idx, vals, n_pix, 1))[:], nx, ny)
+    all_vals    = vcat(vec(w00), vec(w10), vec(w01), vec(w11))
+    all_indices = vcat(vec(lin00), vec(lin10), vec(lin01), vec(lin11))
+    D = reshape(scatter_add(all_vals, all_indices, n_pix), nx, ny)
 
     # Phase C — Gaussian convolution without mutation
     D_pad = vcat(zeros(w, ny + 2w),
@@ -256,6 +366,137 @@ function caustic_image(prop::Propagator, T::Real;
     )
 
     return xs, ys, I
+end
+
+# ── Gaussian blur (mutation-free) ───────────────────────────────────
+
+function gaussian_blur(M::AbstractMatrix{<:Real}, dx, dy, σ; cutoff_sigmas=4.0)
+    σ <= 0 && return Float64.(M)
+    inv_2σ2 = 1.0 / (2.0 * σ * σ)
+    w = Zygote.ignore() do
+        ceil(Int, cutoff_sigmas * σ / max(dx, dy))
+    end
+    nx, ny = size(M)
+    M_pad = vcat(zeros(w, ny + 2w),
+                 hcat(zeros(nx, w), Float64.(M), zeros(nx, w)),
+                 zeros(w, ny + 2w))
+    return sum(
+        exp(-((di * dx)^2 + (dj * dy)^2) * inv_2σ2) .*
+            M_pad[w+1+di:w+nx+di, w+1+dj:w+ny+dj]
+        for di in -w:w, dj in -w:w
+    )
+end
+
+# ── Differentiable loss factory ──────────────────────────────────────
+
+"""
+    make_caustic_loss(prop, T_time, target, ω_freqs; ...) → loss(params)
+
+Returns a closure `loss(params::AbstractVector) -> scalar` that is
+differentiable with Zygote. The full pipeline is:
+
+    params → (A_mat, φ_mat) → Q → a → I → L
+
+The image-match term uses cosine similarity (1 - cos_sim), making it
+invariant to the absolute brightness of the simulated caustic.
+
+Keyword arguments:
+- `n_water=1.33`: refractive index
+- `sigma=0.0`: caustic rendering blur
+- `σ_blur=0.0`: additional blur for image-match term
+- `λ_energy=0.0`: penalty on sum of squared amplitudes
+- `λ_smooth=0.0`: penalty on high-frequency content
+"""
+function make_caustic_loss(prop::Propagator, T_time::Real,
+                           target::Matrix{<:Real}, ω_freqs::AbstractVector;
+                           n_water=1.33, sigma=0.0, σ_blur=0.0,
+                           λ_energy=0.0, λ_smooth=0.0)
+    n_act = length(prop.sim.actuators)
+    n_freq = length(ω_freqs)
+    t_grid = prop.t_grid
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+
+    # Pre-blur target once (constant w.r.t. params)
+    T_b = gaussian_blur(Float64.(target), dx, dy, σ_blur)
+
+    function loss(params::AbstractVector)
+        A_mat, φ_mat = unpack_params(params, n_act, n_freq)
+
+        # Forward pass
+        Q = params_to_Q(A_mat, φ_mat, ω_freqs, t_grid)
+        a = evaluate_modal_amplitudes(prop, T_time, Q)
+        _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
+
+        # Term 1: cosine similarity (scale-invariant pattern match)
+        I_b = gaussian_blur(I, dx, dy, σ_blur)
+        dot_IT = sum(I_b .* T_b)
+        norm_I = sqrt(sum(I_b .^ 2) + 1e-12)
+        norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
+        L_match = 1 - dot_IT / (norm_I * norm_T)
+
+        # Term 2: energy penalty Σ A²
+        L_energy = sum(A_mat .^ 2)
+
+        # Term 3: smoothness penalty ½ Σ (A·ω)²
+        L_smooth = 0.5 * sum((A_mat .* ω_freqs') .^ 2)
+
+        return L_match + λ_energy * L_energy + λ_smooth * L_smooth
+    end
+
+    return loss
+end
+
+# ── Loss function (original, non-AD) ────────────────────────────────
+#
+#   L = ImageMatch(I, T) + λ_energy Σ Aᵢ² + λ_smooth Smoothness(q)
+#
+# ImageMatch: Gaussian-blurred L2 distance between caustic and target.
+# Energy:    Penalises large actuator amplitudes (prevents huge waves).
+# Smoothness: Penalises high-frequency content in actuator signals.
+#   - SineSum:  analytic  ½ Σ (Aₙ ωₙ)²  (time-averaged |dq/dt|²)
+#   - Generic:  finite-difference  Σ (Δq/Δt)² Δt
+
+function caustic_loss(prop::Propagator, T_time::Real, target::Matrix{<:Real};
+                      n_water=1.33, sigma=0.0,
+                      σ_blur=0.0, λ_energy=0.0, λ_smooth=0.0)
+
+    _, _, I = caustic_image(prop, T_time; n_water=n_water, sigma=sigma)
+
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+
+    # ── Term 1: blurred image-match ──
+    I_b = gaussian_blur(I, dx, dy, σ_blur)
+    T_b = gaussian_blur(Float64.(target), dx, dy, σ_blur)
+    L_match = sum((I_b .- T_b) .^ 2) * dx * dy      # integrate over area
+
+    # ── Term 2: energy penalty  Σ Aᵢₙ² ──
+    L_energy = 0.0
+    for act in prop.sim.actuators
+        if act.forcing isa SineSum
+            L_energy += sum(act.forcing.A .^ 2)
+        end
+    end
+
+    # ── Term 3: smoothness penalty ──
+    L_smooth = 0.0
+    for act in prop.sim.actuators
+        f = act.forcing
+        if f isa SineSum
+            # Time-averaged (dq/dt)² = ½ Σ (Aₙ ωₙ)²
+            L_smooth += 0.5 * sum((f.A .* f.ω) .^ 2)
+        else
+            # Finite-difference fallback for generic callables
+            t_grid = prop.t_grid
+            dt = prop.sim.dt
+            q = f.(t_grid)
+            dq = diff(q) ./ dt
+            L_smooth += sum(dq .^ 2) * dt
+        end
+    end
+
+    return L_match + λ_energy * L_energy + λ_smooth * L_smooth
 end
 
 # ── Visualization ────────────────────────────────────────────────────
@@ -305,8 +546,8 @@ function visualize(prop::Propagator; fps=30, clims=nothing)
 end
 
 function visualize_caustic(prop::Propagator;
-                           fps=30, clims=nothing, n_water=1.33,
-                           sigma=0.0, filename="caustic.gif")
+                           fps=30, speed=1.0, clims=nothing, n_water=1.33,
+                           sigma=0.0, filename="caustic.gif", Q=nothing)
     plt = try
         Main.Plots
     catch
@@ -315,7 +556,7 @@ function visualize_caustic(prop::Propagator;
 
     (; sim, xs, ys) = prop
     t0, t1 = sim.tspan
-    dt_frame = 1.0 / fps
+    dt_frame = speed / fps
     frames = t0:dt_frame:t1
 
     # Pre-sample to auto-determine clims if not provided
@@ -323,7 +564,12 @@ function visualize_caustic(prop::Propagator;
         sample_times = range(t0 + 0.1, t1, length=min(10, length(frames)))
         all_vals = Float64[]
         for t in sample_times
-            _, _, I = caustic_image(prop, t; n_water=n_water, sigma=sigma)
+            if Q !== nothing
+                a = evaluate_modal_amplitudes(prop, t, Q)
+                _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
+            else
+                _, _, I = caustic_image(prop, t; n_water=n_water, sigma=sigma)
+            end
             append!(all_vals, vec(I))
         end
         sort!(all_vals)
@@ -336,7 +582,12 @@ function visualize_caustic(prop::Propagator;
 
     anim = plt.Animation()
     for T in frames
-        _, _, I = caustic_image(prop, T; n_water=n_water, sigma=sigma)
+        if Q !== nothing
+            a = evaluate_modal_amplitudes(prop, T, Q)
+            _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
+        else
+            _, _, I = caustic_image(prop, T; n_water=n_water, sigma=sigma)
+        end
         p = plt.heatmap(xs, ys, I',
                 xlabel="x (m)", ylabel="y (m)",
                 title=@sprintf("Caustic Pattern  t = %5.2f s", T),
