@@ -23,7 +23,9 @@ struct Actuator
     x::Float64
     y::Float64
     forcing::Function  # t → amplitude
+    width::Float64     # Gaussian half-width σ (0 = point source)
 end
+Actuator(x, y, forcing; width=0.0) = Actuator(x, y, forcing, width)
 
 struct WaveSim
     tank::Tank
@@ -94,12 +96,20 @@ function build_propagator(sim::WaveSim; nx=100, ny=50)
     φ(m, n, x, y) = cos(m * π * x / Lx) * cos(n * π * y / Ly)
 
     # Coupling matrix C[j, i]
+    # For finite-width actuators (Gaussian blob with half-width σ_a),
+    # the coupling picks up exp(-½ σ_a² k²) per spatial dimension,
+    # which suppresses high-k modes that a finite actuator can't excite.
     n_act = length(actuators)
     C = zeros(n_total, n_act)
     for i in 1:n_act
         ax, ay = actuators[i].x, actuators[i].y
+        σ_a = actuators[i].width
         for j in 1:n_total
-            C[j, i] = φ(mode_m[j], mode_n[j], ax, ay) / norm_j(mode_m[j], mode_n[j])
+            m, n = mode_m[j], mode_n[j]
+            kx = m * π / Lx
+            ky = n * π / Ly
+            blob = σ_a > 0 ? exp(-0.5 * σ_a^2 * (kx^2 + ky^2)) : 1.0
+            C[j, i] = φ(m, n, ax, ay) * blob / norm_j(m, n)
         end
     end
 
