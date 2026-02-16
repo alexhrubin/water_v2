@@ -1,9 +1,11 @@
 module WaveTank
 
 using LinearAlgebra
+using Printf
 
 export Tank, Actuator, WaveSim, Propagator
 export build_propagator, evaluate_surface, visualize
+export evaluate_modal_amplitudes, caustic_image, visualize_caustic
 
 # ── Data structures ──────────────────────────────────────────────────
 
@@ -43,6 +45,9 @@ struct Propagator
     C::Matrix{Float64}
     # Spatial basis Φ[j, nx*ny] on evaluation grid
     Φ::Matrix{Float64}
+    # Analytic spatial derivatives of eigenmodes
+    dΦ_dx::Matrix{Float64}  # dφ_j/dx evaluated on grid
+    dΦ_dy::Matrix{Float64}  # dφ_j/dy evaluated on grid
     # Evaluation grid
     xs::Vector{Float64}
     ys::Vector{Float64}
@@ -97,22 +102,29 @@ function build_propagator(sim::WaveSim; nx=100, ny=50)
         end
     end
 
-    # Spatial basis Φ[j, nx*ny] on evaluation grid
+    # Spatial basis Φ[j, nx*ny] and derivative matrices on evaluation grid
     xs = range(0, Lx, length=nx)
     ys = range(0, Ly, length=ny)
     Φ = zeros(n_total, nx * ny)
+    dΦ_dx = zeros(n_total, nx * ny)
+    dΦ_dy = zeros(n_total, nx * ny)
     idx = 0
     for iy in 1:ny, ix in 1:nx
         idx += 1
         for j in 1:n_total
-            Φ[j, idx] = φ(mode_m[j], mode_n[j], xs[ix], ys[iy])
+            m, n = mode_m[j], mode_n[j]
+            Φ[j, idx] = φ(m, n, xs[ix], ys[iy])
+            # dφ/dx = -mπ/Lx · sin(mπx/Lx) · cos(nπy/Ly)
+            dΦ_dx[j, idx] = -m * π / Lx * sin(m * π * xs[ix] / Lx) * cos(n * π * ys[iy] / Ly)
+            # dφ/dy = -nπ/Ly · cos(mπx/Lx) · sin(nπy/Ly)
+            dΦ_dy[j, idx] = -n * π / Ly * cos(m * π * xs[ix] / Lx) * sin(n * π * ys[iy] / Ly)
         end
     end
 
     # Time grid
     t_grid = collect(tspan[1]:dt:tspan[2])
 
-    return Propagator(sim, mode_m, mode_n, ω, ω_d, C, Φ,
+    return Propagator(sim, mode_m, mode_n, ω, ω_d, C, Φ, dΦ_dx, dΦ_dy,
                       collect(xs), collect(ys), nx, ny, t_grid)
 end
 
@@ -123,10 +135,10 @@ function green_kernel(ω_j, ω_dj, γ, τ)
     return exp(-γ * ω_j * τ) * sin(ω_dj * τ) / ω_dj
 end
 
-# ── Evaluate surface ─────────────────────────────────────────────────
+# ── Modal amplitudes ────────────────────────────────────────────────
 
-function evaluate_surface(prop::Propagator, T::Real)
-    (; sim, C, Φ, ω, ω_d, t_grid, xs, ys, nx, ny) = prop
+function evaluate_modal_amplitudes(prop::Propagator, T::Real)
+    (; sim, C, ω, ω_d, t_grid) = prop
     (; tank, actuators, dt) = sim
     γ = tank.damping
 
@@ -157,11 +169,80 @@ function evaluate_surface(prop::Propagator, T::Real)
         a[j] = s * dt
     end
 
+    return a
+end
+
+# ── Evaluate surface ─────────────────────────────────────────────────
+
+function evaluate_surface(prop::Propagator, T::Real)
+    (; Φ, xs, ys, nx, ny) = prop
+
+    a = evaluate_modal_amplitudes(prop, T)
+
     # Spatial reconstruction: η = Φᵀ · a → [nx*ny]
     η_flat = Φ' * a
     η = reshape(η_flat, nx, ny)
 
     return xs, ys, η
+end
+
+# ── Caustic rendering ───────────────────────────────────────────────
+
+function caustic_image(prop::Propagator, T::Real;
+                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
+    (; sim, Φ, dΦ_dx, dΦ_dy, xs, ys, nx, ny) = prop
+    depth = sim.tank.depth
+
+    a = evaluate_modal_amplitudes(prop, T)
+
+    # Surface height and analytic gradients
+    η_flat = Φ' * a
+    dη_dx_flat = dΦ_dx' * a
+    dη_dy_flat = dΦ_dy' * a
+
+    # Default sigma: 1.5 × max grid spacing
+    dx = xs[2] - xs[1]
+    dy = ys[2] - ys[1]
+    σ = sigma > 0 ? sigma : 1.5 * max(dx, dy)
+
+    σ2 = σ * σ
+    inv_2σ2 = 1.0 / (2.0 * σ2)
+    window = ceil(Int, cutoff_sigmas * σ / max(dx, dy))
+
+    ratio = 1.0 / n_water
+
+    I = zeros(nx, ny)
+
+    # For each grid point (ray source), compute refracted landing and splat
+    idx = 0
+    for iy in 1:ny, ix in 1:nx
+        idx += 1
+        η_val = η_flat[idx]
+        dηdx = dη_dx_flat[idx]
+        dηdy = dη_dy_flat[idx]
+
+        # Landing position of refracted ray on tank bottom
+        x_land = xs[ix] + (depth - η_val) * dηdx * ratio
+        y_land = ys[iy] + (depth - η_val) * dηdy * ratio
+
+        # Convert landing to fractional grid indices
+        fx = (x_land - xs[1]) / dx + 1.0
+        fy = (y_land - ys[1]) / dy + 1.0
+
+        # Splatting window bounds (clamped to grid)
+        ix_min = max(1, floor(Int, fx) - window)
+        ix_max = min(nx, ceil(Int, fx) + window)
+        iy_min = max(1, floor(Int, fy) - window)
+        iy_max = min(ny, ceil(Int, fy) + window)
+
+        for jy in iy_min:iy_max, jx in ix_min:ix_max
+            dist2 = (xs[jx] - x_land)^2 + (ys[jy] - y_land)^2
+            w = exp(-dist2 * inv_2σ2)
+            I[jx, jy] += w
+        end
+    end
+
+    return xs, ys, I
 end
 
 # ── Visualization ────────────────────────────────────────────────────
@@ -197,7 +278,7 @@ function visualize(prop::Propagator; fps=30, clims=nothing)
         _, _, η = evaluate_surface(prop, T)
         p = plt.heatmap(xs, ys, η',
                 xlabel="x (m)", ylabel="y (m)",
-                title="Wave Tank  t = $(round(T, digits=2)) s",
+                title=@sprintf("Wave Tank  t = %5.2f s", T),
                 color=:RdBu, clims=clims,
                 aspect_ratio=:equal, size=(800, 400))
         for act in sim.actuators
@@ -208,6 +289,46 @@ function visualize(prop::Propagator; fps=30, clims=nothing)
     end
 
     return plt.gif(anim, "wave_tank.gif", fps=fps)
+end
+
+function visualize_caustic(prop::Propagator;
+                           fps=30, clims=nothing, n_water=1.33,
+                           sigma=0.0, filename="caustic.gif")
+    plt = try
+        Main.Plots
+    catch
+        error("Plots.jl must be loaded before calling visualize_caustic(). Run `using Plots` first.")
+    end
+
+    (; sim, xs, ys) = prop
+    t0, t1 = sim.tspan
+    dt_frame = 1.0 / fps
+    frames = t0:dt_frame:t1
+
+    # Pre-sample to auto-determine clims if not provided
+    if clims === nothing
+        sample_times = range(t0 + 0.1, t1, length=min(10, length(frames)))
+        maxval = 0.0
+        for t in sample_times
+            _, _, I = caustic_image(prop, t; n_water=n_water, sigma=sigma)
+            maxval = max(maxval, maximum(I))
+        end
+        maxval = max(maxval, 1e-10)
+        clims = (0.0, maxval)
+    end
+
+    anim = plt.Animation()
+    for T in frames
+        _, _, I = caustic_image(prop, T; n_water=n_water, sigma=sigma)
+        p = plt.heatmap(xs, ys, I',
+                xlabel="x (m)", ylabel="y (m)",
+                title=@sprintf("Caustic Pattern  t = %5.2f s", T),
+                color=:inferno, clims=clims,
+                aspect_ratio=:equal, size=(800, 400))
+        plt.frame(anim, p)
+    end
+
+    return plt.gif(anim, filename, fps=fps)
 end
 
 end # module
