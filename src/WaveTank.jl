@@ -4,11 +4,14 @@ using LinearAlgebra
 using SparseArrays
 using Printf
 using Zygote
+using FileIO
+using ColorTypes
 
 export Tank, Actuator, SineSum, WaveSim, Propagator
 export build_propagator, evaluate_surface, visualize
 export evaluate_modal_amplitudes, caustic_image, caustic_loss, visualize_caustic
 export params_to_Q, pack_params, unpack_params, make_caustic_loss
+export load_target_image
 
 # ── Data structures ──────────────────────────────────────────────────
 
@@ -597,6 +600,42 @@ function visualize_caustic(prop::Propagator;
     end
 
     return plt.gif(anim, filename, fps=fps)
+end
+
+# ── Image target loading ──────────────────────────────────────────────
+
+"""
+    load_target_image(path, prop; invert=false) → Matrix{Float64}
+
+Load an image file (JPG, PNG, etc.), convert to grayscale, and resample
+to the propagator's `nx × ny` grid.  Returns a `Matrix{Float64}` in [0,1]
+suitable for `make_caustic_loss`.
+
+If `invert=true`, dark pixels become high target values (useful when the
+subject is dark on a light background).
+"""
+function load_target_image(path::AbstractString, prop::Propagator; invert=false)
+    img = FileIO.load(path)
+    gray = Gray.(img)                           # convert to grayscale
+    mat = Float64.(gray)                        # Matrix{Float64} in [0,1]
+    if invert
+        mat = 1.0 .- mat                        # dark regions → high target
+    end
+    # Resize to match propagator grid (nx × ny) using nearest-neighbor
+    # img is (height, width) i.e. (ny_img, nx_img); we need (nx, ny)
+    ny_img, nx_img = size(mat)
+    nx, ny = length(prop.xs), length(prop.ys)
+    target = zeros(nx, ny)
+    for j in 1:ny
+        for i in 1:nx
+            xi = clamp(round(Int, (i - 1) / (nx - 1) * (nx_img - 1)) + 1, 1, nx_img)
+            yi = clamp(round(Int, (j - 1) / (ny - 1) * (ny_img - 1)) + 1, 1, ny_img)
+            target[i, j] = mat[yi, xi]
+        end
+    end
+    # Normalize to [0, 1]
+    target ./= max(maximum(target), 1e-10)
+    return target
 end
 
 end # module
