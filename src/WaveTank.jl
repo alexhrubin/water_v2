@@ -10,7 +10,7 @@ using ColorTypes
 export Tank, Actuator, SineSum, WaveSim, Propagator
 export build_propagator, evaluate_surface, visualize
 export evaluate_modal_amplitudes, caustic_image, caustic_loss, visualize_caustic
-export params_to_Q, pack_params, unpack_params, make_caustic_loss
+export params_to_Q, pack_params, unpack_params, make_caustic_loss, make_caustic_loss_refining
 export load_target_image
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -430,6 +430,60 @@ function make_caustic_loss(prop::Propagator, T_time::Real,
         Q = params_to_Q(A_mat, φ_mat, ω_freqs, t_grid)
         a = evaluate_modal_amplitudes(prop, T_time, Q)
         _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
+
+        # Term 1: cosine similarity (scale-invariant pattern match)
+        I_b = gaussian_blur(I, dx, dy, σ_blur)
+        dot_IT = sum(I_b .* T_b)
+        norm_I = sqrt(sum(I_b .^ 2) + 1e-12)
+        norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
+        L_match = 1 - dot_IT / (norm_I * norm_T)
+
+        # Term 2: energy penalty Σ A²
+        L_energy = sum(A_mat .^ 2)
+
+        # Term 3: smoothness penalty ½ Σ (A·ω)²
+        L_smooth = 0.5 * sum((A_mat .* ω_freqs') .^ 2)
+
+        return L_match + λ_energy * L_energy + λ_smooth * L_smooth
+    end
+
+    return loss
+end
+
+"""
+    make_caustic_loss_refining(prop, T_time, target, ω_freqs,
+                               sigma_ref, σ_blur_ref; ...) → loss(params)
+
+Like `make_caustic_loss`, but takes `Ref{Float64}` wrappers for `sigma` and
+`σ_blur` so the caller can mutate them between iterations for progressive
+coarse-to-fine annealing.  The target is re-blurred inside the closure on
+every call (since `σ_blur` changes over time).
+"""
+function make_caustic_loss_refining(prop::Propagator, T_time::Real,
+                                    target::Matrix{<:Real}, ω_freqs::AbstractVector,
+                                    sigma_ref::Ref{Float64}, σ_blur_ref::Ref{Float64};
+                                    n_water=1.33, λ_energy=0.0, λ_smooth=0.0)
+    n_act = length(prop.sim.actuators)
+    n_freq = length(ω_freqs)
+    t_grid = prop.t_grid
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+    target_f64 = Float64.(target)
+
+    function loss(params::AbstractVector)
+        A_mat, φ_mat = unpack_params(params, n_act, n_freq)
+
+        # Read current sigma values from refs
+        sigma = sigma_ref[]
+        σ_blur = σ_blur_ref[]
+
+        # Forward pass
+        Q = params_to_Q(A_mat, φ_mat, ω_freqs, t_grid)
+        a = evaluate_modal_amplitudes(prop, T_time, Q)
+        _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
+
+        # Re-blur target each call since σ_blur changes over time
+        T_b = gaussian_blur(target_f64, dx, dy, σ_blur)
 
         # Term 1: cosine similarity (scale-invariant pattern match)
         I_b = gaussian_blur(I, dx, dy, σ_blur)
