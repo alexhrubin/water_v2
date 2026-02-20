@@ -432,9 +432,8 @@ function make_caustic_loss(prop::Propagator, T_time::Real,
         _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
 
         # Term 1: cosine similarity (scale-invariant pattern match)
-        I_b = gaussian_blur(I, dx, dy, σ_blur)
-        dot_IT = sum(I_b .* T_b)
-        norm_I = sqrt(sum(I_b .^ 2) + 1e-12)
+        dot_IT = sum(I .* T_b)
+        norm_I = sqrt(sum(I .^ 2) + 1e-12)
         norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
         L_match = 1 - dot_IT / (norm_I * norm_T)
 
@@ -486,9 +485,8 @@ function make_caustic_loss_refining(prop::Propagator, T_time::Real,
         T_b = gaussian_blur(target_f64, dx, dy, σ_blur)
 
         # Term 1: cosine similarity (scale-invariant pattern match)
-        I_b = gaussian_blur(I, dx, dy, σ_blur)
-        dot_IT = sum(I_b .* T_b)
-        norm_I = sqrt(sum(I_b .^ 2) + 1e-12)
+        dot_IT = sum(I .* T_b)
+        norm_I = sqrt(sum(I .^ 2) + 1e-12)
         norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
         L_match = 1 - dot_IT / (norm_I * norm_T)
 
