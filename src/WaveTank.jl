@@ -15,6 +15,7 @@ export transfer_matrix, steady_state_amplitudes
 export reconstruct_surface, reconstruct_surface_hessian, snell_landing
 export caustic_image_jacobian
 export pack_complex, unpack_complex, make_caustic_loss_ss, make_caustic_loss_ss_refining
+export make_caustic_loss_ss_keyframes
 export load_target_image
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -520,8 +521,16 @@ function caustic_image(prop::Propagator, a::AbstractVector;
 
     # Phase B — Bilinear splatting via scatter_add (Zygote-compatible)
     n_pix = nx * ny
-    fi = clamp.((x_land .- xs[1]) ./ dx .+ 1.0, 1.0, Float64(nx))
-    fj = clamp.((y_land .- ys[1]) ./ dy .+ 1.0, 1.0, Float64(ny))
+    fi_raw = (x_land .- xs[1]) ./ dx .+ 1.0
+    fj_raw = (y_land .- ys[1]) ./ dy .+ 1.0
+
+    # Rays landing outside the tank floor contribute zero (they hit the wall)
+    fi = clamp.(fi_raw, 1.0, Float64(nx))   # clamp for safe indexing
+    fj = clamp.(fj_raw, 1.0, Float64(ny))
+    mask = Zygote.ignore() do
+        Float64.((fi_raw .>= 1.0) .& (fi_raw .<= Float64(nx)) .&
+                 (fj_raw .>= 1.0) .& (fj_raw .<= Float64(ny)))
+    end
 
     # Integer indices — no gradient needed
     ix0, iy0, lin00, lin10, lin01, lin11 = Zygote.ignore() do
@@ -537,10 +546,10 @@ function caustic_image(prop::Propagator, a::AbstractVector;
     wx = fi .- Float64.(ix0)
     wy = fj .- Float64.(iy0)
 
-    w00 = (1.0 .- wx) .* (1.0 .- wy)
-    w10 = wx           .* (1.0 .- wy)
-    w01 = (1.0 .- wx) .* wy
-    w11 = wx           .* wy
+    w00 = mask .* (1.0 .- wx) .* (1.0 .- wy)
+    w10 = mask .* wx           .* (1.0 .- wy)
+    w01 = mask .* (1.0 .- wx) .* wy
+    w11 = mask .* wx           .* wy
 
     all_vals    = vcat(vec(w00), vec(w10), vec(w01), vec(w11))
     all_indices = vcat(vec(lin00), vec(lin10), vec(lin01), vec(lin11))
@@ -949,6 +958,108 @@ function make_caustic_loss_ss_refining(prop::Propagator, T_time::Real,
             E_T = exp.(im .* Ω_freqs .* T_time)
             dadt = real(α * (im .* Ω_freqs .* E_T))
             L_match = L_match + λ_temporal * sum(dadt .^ 2)
+        end
+
+        L_energy = sum(X .^ 2) + sum(Y .^ 2)
+
+        return L_match + λ_energy * L_energy
+    end
+
+    return loss
+end
+
+"""
+    make_caustic_loss_ss_keyframes(prop, keyframes, Ω_freqs,
+                                   sigma_ref, σ_blur_ref; ...) → loss(params)
+
+Multi-keyframe steady-state loss. `keyframes` is a vector of NamedTuples
+`(t=..., target=..., weight=...)` specifying target images at different times.
+Supports temporal windowing and da/dt penalty per keyframe.
+"""
+function make_caustic_loss_ss_keyframes(
+        prop::Propagator,
+        keyframes::Vector{<:NamedTuple},
+        Ω_freqs::AbstractVector,
+        sigma_ref::Ref{Float64}, σ_blur_ref::Ref{Float64};
+        n_water=1.33, λ_energy=0.0,
+        loss_type::Symbol=:cosine, σ_ssim=nothing,
+        n_temporal::Int=1, σ_temporal::Float64=0.0,
+        λ_temporal::Float64=0.0)
+
+    n_act = length(prop.sim.actuators)
+    n_freq = length(Ω_freqs)
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+    n_kf = length(keyframes)
+
+    γ = prop.sim.tank.damping
+    H = transfer_matrix(prop.ω, Ω_freqs, γ)
+
+    # Normalize keyframe weights
+    kf_weights = [Float64(kf.weight) for kf in keyframes]
+    kf_weights ./= sum(kf_weights)
+    kf_times = [Float64(kf.t) for kf in keyframes]
+    kf_targets = [Float64.(kf.target) for kf in keyframes]
+
+    # Precompute temporal sample offsets and weights
+    δs, ws = if n_temporal > 1
+        δs_ = collect(range(-3σ_temporal, 3σ_temporal, length=n_temporal))
+        ws_ = [exp(-δ^2 / (2 * σ_temporal^2 + 1e-30)) for δ in δs_]
+        ws_ ./= sum(ws_)
+        (δs_, ws_)
+    else
+        (Float64[0.0], Float64[1.0])
+    end
+
+    # Cache blurred targets — one per keyframe, recompute when σ_blur changes
+    cached_σ_blur = Ref(-1.0)
+    cached_T_bs = Ref(kf_targets)
+    cached_norm_Ts = Ref([sqrt(sum(t .^ 2) + 1e-12) for t in kf_targets])
+
+    function loss(params::AbstractVector)
+        X, Y = unpack_complex(params, n_act, n_freq)
+        P = X .+ im .* Y
+
+        sigma = sigma_ref[]
+        σ_blur = σ_blur_ref[]
+
+        α = H .* (prop.C * P)
+
+        # Recompute blurred targets when σ_blur changes
+        T_bs = Zygote.ignore() do
+            if σ_blur != cached_σ_blur[]
+                cached_σ_blur[] = σ_blur
+                blurred = [gaussian_blur(t, dx, dy, σ_blur) for t in kf_targets]
+                cached_T_bs[] = blurred
+                cached_norm_Ts[] = [sqrt(sum(b .^ 2) + 1e-12) for b in blurred]
+            end
+            cached_T_bs[]
+        end
+        norm_Ts = Zygote.ignore() do; cached_norm_Ts[] end
+
+        # Sum weighted loss across keyframes
+        L_match = zero(eltype(params))
+        for j in 1:n_kf
+            T_b_j = T_bs[j]
+            norm_T_j = norm_Ts[j]
+            t_j = kf_times[j]
+
+            # Temporal window around this keyframe
+            for k in 1:length(δs)
+                E_k = exp.(im .* Ω_freqs .* (t_j + δs[k]))
+                a_k = imag(α * E_k)
+                _, _, I_k = caustic_image(prop, a_k; n_water=n_water, sigma=sigma)
+                L_k = loss_type == :ssim ? _ssim_loss(I_k, T_b_j, dx, dy; σ_ssim) :
+                                           _cosine_loss(I_k, T_b_j, norm_T_j)
+                L_match = L_match + kf_weights[j] * ws[k] * L_k
+            end
+
+            # da/dt penalty at this keyframe's time
+            if λ_temporal > 0
+                E_T = exp.(im .* Ω_freqs .* t_j)
+                dadt = real(α * (im .* Ω_freqs .* E_T))
+                L_match = L_match + λ_temporal * sum(dadt .^ 2) / n_kf
+            end
         end
 
         L_energy = sum(X .^ 2) + sum(Y .^ 2)
