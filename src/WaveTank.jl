@@ -11,6 +11,10 @@ export Tank, Actuator, SineSum, WaveSim, Propagator
 export build_propagator, evaluate_surface, visualize
 export evaluate_modal_amplitudes, caustic_image, caustic_loss, visualize_caustic
 export params_to_Q, pack_params, unpack_params, make_caustic_loss, make_caustic_loss_refining
+export transfer_matrix, steady_state_amplitudes
+export reconstruct_surface, reconstruct_surface_hessian, snell_landing
+export caustic_image_jacobian
+export pack_complex, unpack_complex, make_caustic_loss_ss, make_caustic_loss_ss_refining
 export load_target_image
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -77,6 +81,27 @@ function unpack_params(params::AbstractVector, n_act::Int, n_freq::Int)
     return A_mat, φ_mat
 end
 
+# ── Complex phasor parameter helpers (for steady-state AD) ──────────
+
+"""
+    pack_complex(X, Y) → flat real vector [vec(X); vec(Y)]
+
+Pack real and imaginary parts of complex phasors into a single parameter vector.
+"""
+pack_complex(X::AbstractMatrix, Y::AbstractMatrix) = vcat(vec(X), vec(Y))
+
+"""
+    unpack_complex(params, n_act, n_freq) → (X, Y) real matrices
+
+Inverse of `pack_complex`. Returns Re and Im parts as separate matrices.
+"""
+function unpack_complex(params::AbstractVector, n_act::Int, n_freq::Int)
+    n = n_act * n_freq
+    X = reshape(params[1:n], n_act, n_freq)
+    Y = reshape(params[n+1:2n], n_act, n_freq)
+    return X, Y
+end
+
 struct Actuator{F}
     x::Float64
     y::Float64
@@ -104,11 +129,18 @@ struct Propagator
     ω_d::Vector{Float64}    # damped frequencies
     # Coupling matrix C[j, i] = φ_j(x_i, y_i) / N_j
     C::Matrix{Float64}
-    # Spatial basis Φ[j, nx*ny] on evaluation grid
+    # Dense spatial basis Φ[j, nx*ny] — empty when dense_basis=false
     Φ::Matrix{Float64}
-    # Analytic spatial derivatives of eigenmodes
-    dΦ_dx::Matrix{Float64}  # dφ_j/dx evaluated on grid
-    dΦ_dy::Matrix{Float64}  # dφ_j/dy evaluated on grid
+    dΦ_dx::Matrix{Float64}
+    dΦ_dy::Matrix{Float64}
+    # Separable 1D basis matrices (always populated, tiny memory)
+    cos_x::Matrix{Float64}    # [nx × n_modes] cos(mπx/Lx)
+    cos_y::Matrix{Float64}    # [ny × n_modes] cos(nπy/Ly)
+    dcos_x::Matrix{Float64}   # [nx × n_modes] -mπ/Lx · sin(mπx/Lx)
+    dcos_y::Matrix{Float64}   # [ny × n_modes] -nπ/Ly · sin(nπy/Ly)
+    d2cos_x::Matrix{Float64}  # [nx × n_modes] -(mπ/Lx)² · cos(mπx/Lx)
+    d2cos_y::Matrix{Float64}  # [ny × n_modes] -(nπ/Ly)² · cos(nπy/Ly)
+    lin_2d::Vector{Int}       # flat mode j → linear index in [n_modes × n_modes] grid
     # Evaluation grid
     xs::Vector{Float64}
     ys::Vector{Float64}
@@ -116,15 +148,16 @@ struct Propagator
     ny::Int
     # Time grid
     t_grid::Vector{Float64}
+    # Cached coordinate grids [nx × ny]
+    X_src::Matrix{Float64}
+    Y_src::Matrix{Float64}
 end
 
 # ── Build propagator ─────────────────────────────────────────────────
 
-function build_propagator(sim::WaveSim; nx=100, ny=50)
+function build_propagator(sim::WaveSim; nx=100, ny=50, dense_basis=true)
     (; tank, actuators, tspan, dt, n_modes) = sim
     (; Lx, Ly, depth, g, damping) = tank
-
-    c = sqrt(g * depth)  # wave speed
 
     # Collect mode indices, skipping (0,0)
     mode_m = Int[]
@@ -136,14 +169,12 @@ function build_propagator(sim::WaveSim; nx=100, ny=50)
     end
     n_total = length(mode_m)
 
-    # Mode frequencies
-    ω = [c * sqrt((mode_m[j]*π/Lx)^2 + (mode_n[j]*π/Ly)^2) for j in 1:n_total]
+    # Mode wavenumbers and frequencies (full gravity-wave dispersion)
+    k = [sqrt((mode_m[j]*π/Lx)^2 + (mode_n[j]*π/Ly)^2) for j in 1:n_total]
+    ω = [sqrt(g * k[j] * tanh(k[j] * depth)) for j in 1:n_total]
     ω_d = ω .* sqrt(1 - damping^2)
 
     # Normalization factors N_j = ∫∫ φ_j² dx dy
-    # For cos(mπx/Lx)·cos(nπy/Ly):
-    #   ∫₀^Lx cos²(mπx/Lx) dx = Lx/2 if m>0, Lx if m=0
-    #   similarly for y
     function norm_j(m, n)
         Ix = m == 0 ? Lx : Lx / 2
         Iy = n == 0 ? Ly : Ly / 2
@@ -154,9 +185,6 @@ function build_propagator(sim::WaveSim; nx=100, ny=50)
     φ(m, n, x, y) = cos(m * π * x / Lx) * cos(n * π * y / Ly)
 
     # Coupling matrix C[j, i]
-    # For finite-width actuators (Gaussian blob with half-width σ_a),
-    # the coupling picks up exp(-½ σ_a² k²) per spatial dimension,
-    # which suppresses high-k modes that a finite actuator can't excite.
     n_act = length(actuators)
     C = zeros(n_total, n_act)
     for i in 1:n_act
@@ -171,30 +199,52 @@ function build_propagator(sim::WaveSim; nx=100, ny=50)
         end
     end
 
-    # Spatial basis Φ[j, nx*ny] and derivative matrices on evaluation grid
+    # Evaluation grid
     xs = range(0, Lx, length=nx)
     ys = range(0, Ly, length=ny)
-    Φ = zeros(n_total, nx * ny)
-    dΦ_dx = zeros(n_total, nx * ny)
-    dΦ_dy = zeros(n_total, nx * ny)
-    idx = 0
-    for iy in 1:ny, ix in 1:nx
-        idx += 1
-        for j in 1:n_total
-            m, n = mode_m[j], mode_n[j]
-            Φ[j, idx] = φ(m, n, xs[ix], ys[iy])
-            # dφ/dx = -mπ/Lx · sin(mπx/Lx) · cos(nπy/Ly)
-            dΦ_dx[j, idx] = -m * π / Lx * sin(m * π * xs[ix] / Lx) * cos(n * π * ys[iy] / Ly)
-            # dφ/dy = -nπ/Ly · cos(mπx/Lx) · sin(nπy/Ly)
-            dΦ_dy[j, idx] = -n * π / Ly * cos(m * π * xs[ix] / Lx) * sin(n * π * ys[iy] / Ly)
+
+    # ── Separable 1D basis matrices (always computed, tiny memory) ──
+    cos_x   = [cos(m * π * xs[i] / Lx) for i in 1:nx, m in 0:n_modes-1]
+    cos_y   = [cos(n * π * ys[j] / Ly) for j in 1:ny, n in 0:n_modes-1]
+    dcos_x  = [-m * π / Lx * sin(m * π * xs[i] / Lx) for i in 1:nx, m in 0:n_modes-1]
+    dcos_y  = [-n * π / Ly * sin(n * π * ys[j] / Ly) for j in 1:ny, n in 0:n_modes-1]
+    d2cos_x = [-(m * π / Lx)^2 * cos(m * π * xs[i] / Lx) for i in 1:nx, m in 0:n_modes-1]
+    d2cos_y = [-(n * π / Ly)^2 * cos(n * π * ys[j] / Ly) for j in 1:ny, n in 0:n_modes-1]
+
+    # Mapping: flat mode index j → linear index in [n_modes × n_modes] 2D grid
+    lin_2d = [mode_m[j] + 1 + n_modes * mode_n[j] for j in 1:n_total]
+
+    # ── Dense basis matrices (optional, for backward compatibility) ──
+    if dense_basis
+        Φ = zeros(n_total, nx * ny)
+        dΦ_dx = zeros(n_total, nx * ny)
+        dΦ_dy = zeros(n_total, nx * ny)
+        idx = 0
+        for iy in 1:ny, ix in 1:nx
+            idx += 1
+            for j in 1:n_total
+                m, n = mode_m[j], mode_n[j]
+                Φ[j, idx] = φ(m, n, xs[ix], ys[iy])
+                dΦ_dx[j, idx] = -m * π / Lx * sin(m * π * xs[ix] / Lx) * cos(n * π * ys[iy] / Ly)
+                dΦ_dy[j, idx] = -n * π / Ly * cos(m * π * xs[ix] / Lx) * sin(n * π * ys[iy] / Ly)
+            end
         end
+    else
+        Φ = zeros(0, 0)
+        dΦ_dx = zeros(0, 0)
+        dΦ_dy = zeros(0, 0)
     end
 
     # Time grid
     t_grid = collect(tspan[1]:dt:tspan[2])
 
+    xs_vec = collect(xs)
+    ys_vec = collect(ys)
+    X_src = repeat(xs_vec, 1, ny)
+    Y_src = repeat(ys_vec', nx, 1)
     return Propagator(sim, mode_m, mode_n, ω, ω_d, C, Φ, dΦ_dx, dΦ_dy,
-                      collect(xs), collect(ys), nx, ny, t_grid)
+                      cos_x, cos_y, dcos_x, dcos_y, d2cos_x, d2cos_y, lin_2d,
+                      xs_vec, ys_vec, nx, ny, t_grid, X_src, Y_src)
 end
 
 # ── Green's function kernel ──────────────────────────────────────────
@@ -254,18 +304,93 @@ function evaluate_modal_amplitudes(prop::Propagator, T::Real, Q::AbstractMatrix)
     return a
 end
 
+# ── Steady-state frequency-domain formulation ───────────────────────
+
+"""
+    transfer_matrix(ω_modes, Ω_drive, γ) → Complex matrix [n_modes × n_freq]
+
+Frequency-response of each mode to each driving frequency.
+H_j(Ω) = 1 / (ω_j² - Ω² + 2i·γ·ω_j·Ω)
+"""
+function transfer_matrix(ω_modes::AbstractVector, Ω_drive::AbstractVector, γ::Real)
+    return 1 ./ (ω_modes.^2 .- Ω_drive'.^2 .+ 2im .* γ .* ω_modes .* Ω_drive')
+end
+
+"""
+    steady_state_amplitudes(prop, P, Ω_freqs, T) → real vector a [n_modes]
+
+Compute modal amplitudes at time T from the steady-state response to
+sinusoidal actuators with complex phasors P [n_act × n_freq].
+
+P_ik = X_ik + i·Y_ik encodes amplitude and phase of actuator i at frequency k:
+the physical signal is q_i(t) = Σ_k Im[P_ik · e^{iΩ_k t}].
+
+The modal amplitudes are **linear** in P (and in the real parameters X, Y).
+"""
+function steady_state_amplitudes(prop::Propagator, P::AbstractMatrix{<:Complex},
+                                  Ω_freqs::AbstractVector, T::Real)
+    γ = prop.sim.tank.damping
+    H = transfer_matrix(prop.ω, Ω_freqs, γ)       # [n_modes × n_freq]
+    α = H .* (prop.C * P)                           # [n_modes × n_freq]
+    E = exp.(im .* Ω_freqs .* T)                    # [n_freq]
+    a = imag(α * E)                                  # [n_modes]
+    return a
+end
+
 # ── Evaluate surface ─────────────────────────────────────────────────
 
 function evaluate_surface(prop::Propagator, T::Real)
-    (; Φ, xs, ys, nx, ny) = prop
+    (; xs, ys, nx, ny) = prop
 
     a = evaluate_modal_amplitudes(prop, T)
 
-    # Spatial reconstruction: η = Φᵀ · a → [nx*ny]
-    η_flat = Φ' * a
-    η = reshape(η_flat, nx, ny)
+    if size(prop.Φ) == (0, 0)
+        η, _, _ = reconstruct_surface(prop, a)
+    else
+        η = reshape(prop.Φ' * a, nx, ny)
+    end
 
     return xs, ys, η
+end
+
+# ── Separable surface reconstruction ────────────────────────────────
+
+"""
+    reconstruct_surface(prop, a) → (η, dηdx, dηdy)  each [nx × ny]
+
+Reconstruct surface height and gradients from flat modal amplitudes `a`
+using separable 1D basis matrices. O(n_modes × ny × (n_modes + nx)) instead
+of O(n_total × nx × ny) for the dense Φ approach.
+
+Uses `scatter_add` (Zygote-compatible) to map flat modes → 2D mode grid,
+then two matrix multiplies per field.
+"""
+function reconstruct_surface(prop::Propagator, a::AbstractVector)
+    n_modes = prop.sim.n_modes
+    # Scatter flat mode amplitudes to 2D grid [n_modes × n_modes]
+    a_2d = reshape(scatter_add(a, prop.lin_2d, n_modes * n_modes), n_modes, n_modes)
+    # Separable reconstruction: η[i,j] = Σ_m Σ_n a[m,n] cos_x[i,m] cos_y[j,n]
+    η     = prop.cos_x  * a_2d * prop.cos_y'
+    dηdx  = prop.dcos_x * a_2d * prop.cos_y'
+    dηdy  = prop.cos_x  * a_2d * prop.dcos_y'
+    return η, dηdx, dηdy
+end
+
+"""
+    reconstruct_surface_hessian(prop, a) → (η, dηdx, dηdy, d²ηdx², d²ηdy², d²ηdxdy)
+
+Like `reconstruct_surface` but also returns second derivatives.
+"""
+function reconstruct_surface_hessian(prop::Propagator, a::AbstractVector)
+    n_modes = prop.sim.n_modes
+    a_2d = reshape(scatter_add(a, prop.lin_2d, n_modes * n_modes), n_modes, n_modes)
+    η      = prop.cos_x   * a_2d * prop.cos_y'
+    dηdx   = prop.dcos_x  * a_2d * prop.cos_y'
+    dηdy   = prop.cos_x   * a_2d * prop.dcos_y'
+    d2ηdx2 = prop.d2cos_x * a_2d * prop.cos_y'
+    d2ηdy2 = prop.cos_x   * a_2d * prop.d2cos_y'
+    d2ηdxdy = prop.dcos_x * a_2d * prop.dcos_y'
+    return η, dηdx, dηdy, d2ηdx2, d2ηdy2, d2ηdxdy
 end
 
 # ── AD utilities ─────────────────────────────────────────────────────
@@ -284,29 +409,90 @@ Zygote.@adjoint function scatter_add(vals, indices, n)
     return dst, back
 end
 
-# ── Caustic rendering ───────────────────────────────────────────────
+# ── Refraction ──────────────────────────────────────────────────────
+
+"""
+    snell_landing(X_src, Y_src, η, dηdx, dηdy, depth, n_water)
+
+Compute ray landing positions on the tank floor using full vector Snell's law.
+
+Incident ray d̂_i = (0, 0, -1). Surface normal n̂ = normalize(-∂η/∂x, -∂η/∂y, 1).
+Refracted ray is traced from the surface point (x, y, η) to z = 0.
+
+All inputs/outputs are [nx × ny] arrays (pure broadcast, Zygote-compatible).
+"""
+function snell_landing(X_src, Y_src, η, dηdx, dηdy, depth, n_water)
+    # Surface normal components (unnormalized): (-dηdx, -dηdy, 1)
+    inv_norm = 1.0 ./ sqrt.(dηdx.^2 .+ dηdy.^2 .+ 1.0)
+    nx_s = .-dηdx .* inv_norm
+    ny_s = .-dηdy .* inv_norm
+    nz_s = inv_norm
+
+    # Incident ray: d_i = (0, 0, -1)
+    # cos(θ_i) = -d_i · n̂ = nz_s
+    cos_i = nz_s
+
+    # Snell's law: n_air * sin(θ_i) = n_water * sin(θ_t)
+    # sin²(θ_i) = 1 - cos²(θ_i)
+    ratio = 1.0 / n_water   # n_air / n_water
+    sin2_i = 1.0 .- cos_i.^2
+    sin2_t = ratio^2 .* sin2_i
+
+    # cos(θ_t) — clamp to avoid sqrt of negative (total internal reflection edge case)
+    cos_t = sqrt.(max.(1.0 .- sin2_t, 0.0))
+
+    # Refracted ray direction: d_t = ratio * d_i + (ratio * cos_i - cos_t) * n̂
+    # d_i = (0, 0, -1), so:
+    coeff = ratio .* cos_i .- cos_t
+    dt_x = coeff .* nx_s
+    dt_y = coeff .* ny_s
+    dt_z = ratio .* (-1.0) .+ coeff .* nz_s
+
+    # Trace from surface point (X_src, Y_src, η) along d_t to z = 0
+    # z(t) = η + dt_z * t = 0  →  t = -η / dt_z
+    t_hit = .-depth ./ dt_z
+
+    x_land = X_src .+ dt_x .* t_hit
+    y_land = Y_src .+ dt_y .* t_hit
+
+    return x_land, y_land
+end
+
+# ── Caustic rendering ──────────────────────────────────────────────
 
 function caustic_image(prop::Propagator, T::Real;
-                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
+                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0, full_snell=false)
     a = evaluate_modal_amplitudes(prop, T)
-    return caustic_image(prop, a; n_water=n_water, sigma=sigma, cutoff_sigmas=cutoff_sigmas)
+    return caustic_image(prop, a; n_water=n_water, sigma=sigma,
+                         cutoff_sigmas=cutoff_sigmas, full_snell=full_snell)
 end
 
 """
-    caustic_image(prop, a; n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
+    caustic_image(prop, a; n_water=1.33, sigma=0.0, cutoff_sigmas=4.0,
+                  use_separable=nothing, full_snell=false)
 
 Render caustic image from pre-computed modal amplitudes `a`.
 This method is Zygote-differentiable w.r.t. `a`.
+
+Set `full_snell=true` for physically correct vector Snell's law refraction
+(matters for steep waves). Default is the paraxial approximation.
 """
 function caustic_image(prop::Propagator, a::AbstractVector;
-                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0)
-    (; sim, Φ, dΦ_dx, dΦ_dy, xs, ys, nx, ny) = prop
+                       n_water=1.33, sigma=0.0, cutoff_sigmas=4.0,
+                       use_separable=nothing, full_snell=false)
+    (; sim, xs, ys, nx, ny) = prop
     depth = sim.tank.depth
 
-    # Surface height and analytic gradients → reshaped to [nx, ny]
-    η     = reshape(Φ' * a,      nx, ny)
-    dηdx  = reshape(dΦ_dx' * a,  nx, ny)
-    dηdy  = reshape(dΦ_dy' * a,  nx, ny)
+    # Choose reconstruction method: separable if requested or if dense Φ is empty
+    _use_sep = use_separable === nothing ? size(prop.Φ) == (0, 0) : use_separable
+
+    if _use_sep
+        η, dηdx, dηdy = reconstruct_surface(prop, a)
+    else
+        η     = reshape(prop.Φ' * a,      nx, ny)
+        dηdx  = reshape(prop.dΦ_dx' * a,  nx, ny)
+        dηdy  = reshape(prop.dΦ_dy' * a,  nx, ny)
+    end
 
     # Default sigma: 1.5 × max grid spacing
     dx = xs[2] - xs[1]
@@ -320,14 +506,17 @@ function caustic_image(prop::Propagator, a::AbstractVector;
         ceil(Int, cutoff_sigmas * σ / max(dx, dy))
     end
 
-    ratio = 1.0 / n_water
+    # Phase A — Landing positions
+    X_src = prop.X_src
+    Y_src = prop.Y_src
 
-    # Phase A — Landing positions (pure broadcast)
-    X_src = repeat(xs, 1, ny)           # [nx, ny]
-    Y_src = repeat(ys', nx, 1)          # [nx, ny]
-
-    x_land = X_src .+ (depth .- η) .* dηdx .* ratio
-    y_land = Y_src .+ (depth .- η) .* dηdy .* ratio
+    if full_snell
+        x_land, y_land = snell_landing(X_src, Y_src, η, dηdx, dηdy, depth, n_water)
+    else
+        ratio = 1.0 / n_water
+        x_land = X_src .+ (depth .- η) .* dηdx .* ratio
+        y_land = Y_src .+ (depth .- η) .* dηdy .* ratio
+    end
 
     # Phase B — Bilinear splatting via scatter_add (Zygote-compatible)
     n_pix = nx * ny
@@ -357,37 +546,133 @@ function caustic_image(prop::Propagator, a::AbstractVector;
     all_indices = vcat(vec(lin00), vec(lin10), vec(lin01), vec(lin11))
     D = reshape(scatter_add(all_vals, all_indices, n_pix), nx, ny)
 
-    # Phase C — Gaussian convolution without mutation
-    D_pad = vcat(zeros(w, ny + 2w),
-                 hcat(zeros(nx, w), D, zeros(nx, w)),
-                 zeros(w, ny + 2w))
-
-    I = sum(
-        exp(-((di * dx)^2 + (dj * dy)^2) * inv_2σ2) .*
-            D_pad[w+1+di:w+nx+di, w+1+dj:w+ny+dj]
-        for di in -w:w, dj in -w:w
-    )
+    # Phase C — Separable Gaussian convolution (2 × O(w) instead of O(w²))
+    I = _gaussian_blur_separable(D, dx, dy, σ, w)
 
     return xs, ys, I
 end
 
-# ── Gaussian blur (mutation-free) ───────────────────────────────────
+# ── Gaussian blur (mutation-free, separable) ────────────────────────
+
+"""
+    _gaussian_blur_separable(M, dx, dy, σ, w)
+
+Separable 2D Gaussian blur: two 1D passes of width (2w+1) each.
+O(2 × (2w+1) × n_pixels) instead of O((2w+1)² × n_pixels).
+Zygote-compatible (no mutation).
+"""
+function _gaussian_blur_separable(M::AbstractMatrix, dx, dy, σ, w)
+    inv_2σ2 = 1.0 / (2.0 * σ * σ)
+    nx, ny = size(M)
+
+    # Precompute 1D kernel weights (constants w.r.t. differentiated vars)
+    wx, wy = Zygote.ignore() do
+        ([exp(-(di * dx)^2 * inv_2σ2) for di in -w:w],
+         [exp(-(dj * dy)^2 * inv_2σ2) for dj in -w:w])
+    end
+
+    # Pass 1: blur along x (rows)
+    M_padx = vcat(zeros(w, ny), M, zeros(w, ny))
+    tmp = sum(wx[i] .* M_padx[i:nx+i-1, :] for i in 1:2w+1)
+
+    # Pass 2: blur along y (columns)
+    tmp_pady = hcat(zeros(nx, w), tmp, zeros(nx, w))
+    return sum(wy[j] .* tmp_pady[:, j:ny+j-1] for j in 1:2w+1)
+end
 
 function gaussian_blur(M::AbstractMatrix{<:Real}, dx, dy, σ; cutoff_sigmas=4.0)
     σ <= 0 && return Float64.(M)
-    inv_2σ2 = 1.0 / (2.0 * σ * σ)
     w = Zygote.ignore() do
         ceil(Int, cutoff_sigmas * σ / max(dx, dy))
     end
-    nx, ny = size(M)
-    M_pad = vcat(zeros(w, ny + 2w),
-                 hcat(zeros(nx, w), Float64.(M), zeros(nx, w)),
-                 zeros(w, ny + 2w))
-    return sum(
-        exp(-((di * dx)^2 + (dj * dy)^2) * inv_2σ2) .*
-            M_pad[w+1+di:w+nx+di, w+1+dj:w+ny+dj]
-        for di in -w:w, dj in -w:w
-    )
+    return _gaussian_blur_separable(Float64.(M), dx, dy, σ, w)
+end
+
+# ── Loss helpers ─────────────────────────────────────────────────────
+
+function _cosine_loss(I::AbstractMatrix, T_b::AbstractMatrix, norm_T::Real)
+    dot_IT = sum(I .* T_b)
+    norm_I = sqrt(sum(I .^ 2) + 1e-12)
+    return 1.0 - dot_IT / (norm_I * norm_T)
+end
+
+function _ssim_loss(I::AbstractMatrix, T_b::AbstractMatrix, dx, dy; σ_ssim=nothing)
+    σ_w = σ_ssim === nothing ? 1.5 * max(dx, dy) : σ_ssim
+
+    # Scale-normalize I to match T_b's mean
+    n = length(I)
+    mean_T = sum(T_b) / n
+    mean_I = sum(I) / n + 1e-12
+    I_n = I .* (mean_T / mean_I)
+
+    # Stability constants
+    L = Zygote.ignore() do; maximum(T_b) end
+    C1 = (0.01 * L)^2
+    C2 = (0.03 * L)^2
+
+    # Normalization: gaussian_blur computes weighted sums, not means.
+    # Divide by W to get proper local averages (also handles boundary effects).
+    W = Zygote.ignore() do
+        gaussian_blur(ones(size(I_n)), dx, dy, σ_w)
+    end
+
+    # Local statistics via normalized Gaussian-weighted windows
+    μ_x  = gaussian_blur(I_n, dx, dy, σ_w) ./ W
+    μ_y  = Zygote.ignore() do; gaussian_blur(T_b, dx, dy, σ_w) ./ W end
+    σ_x2 = max.(gaussian_blur(I_n .^ 2, dx, dy, σ_w) ./ W .- μ_x .^ 2, 0.0)
+    σ_y2 = Zygote.ignore() do
+        max.(gaussian_blur(T_b .^ 2, dx, dy, σ_w) ./ W .- μ_y .^ 2, 0.0)
+    end
+    σ_xy = gaussian_blur(I_n .* T_b, dx, dy, σ_w) ./ W .- μ_x .* μ_y
+
+    ssim_map = ((2.0 .* μ_x .* μ_y .+ C1) .* (2.0 .* σ_xy .+ C2)) ./
+               ((μ_x .^ 2 .+ μ_y .^ 2 .+ C1) .* (σ_x2 .+ σ_y2 .+ C2))
+    return 1.0 - sum(ssim_map) / n
+end
+
+# ── Jacobian-based caustic intensity ─────────────────────────────────
+
+"""
+    caustic_image_jacobian(prop, a; n_water=1.33, ε=1e-2)
+
+Render caustic intensity from the Jacobian determinant of the ray map.
+Intensity I(x,y) = 1 / (|det(J)| + ε), giving analytically sharp caustic
+lines wherever det(J) → 0.
+
+Requires separable basis matrices (always available in Propagator).
+Suitable for high-quality visualization; use splatting-based `caustic_image`
+for optimization (smoother loss landscape).
+"""
+function caustic_image_jacobian(prop::Propagator, a::AbstractVector;
+                                 n_water=1.33, ε=1e-2, sigma=0.0)
+    (; xs, ys, nx, ny) = prop
+    depth = prop.sim.tank.depth
+
+    η, dηdx, dηdy, d2ηdx2, d2ηdy2, d2ηdxdy = reconstruct_surface_hessian(prop, a)
+
+    r = 1.0 / n_water
+
+    # Jacobian of the ray map (x,y) → (x_land, y_land):
+    # J₁₁ = 1 + r·[(d-η)·η_xx - η_x²]
+    # J₁₂ = r·[(d-η)·η_xy - η_x·η_y]
+    # J₂₁ = J₁₂  (symmetric for paraxial)
+    # J₂₂ = 1 + r·[(d-η)·η_yy - η_y²]
+    h = depth .- η
+    J11 = 1.0 .+ r .* (h .* d2ηdx2  .- dηdx.^2)
+    J22 = 1.0 .+ r .* (h .* d2ηdy2  .- dηdy.^2)
+    J12 = r .* (h .* d2ηdxdy .- dηdx .* dηdy)
+
+    det_J = J11 .* J22 .- J12.^2
+
+    I = 1.0 ./ (abs.(det_J) .+ ε)
+
+    if sigma > 0
+        dx = xs[2] - xs[1]
+        dy = ys[2] - ys[1]
+        I = gaussian_blur(I, dx, dy, sigma)
+    end
+
+    return xs, ys, I
 end
 
 # ── Differentiable loss factory ──────────────────────────────────────
@@ -413,7 +698,8 @@ Keyword arguments:
 function make_caustic_loss(prop::Propagator, T_time::Real,
                            target::Matrix{<:Real}, ω_freqs::AbstractVector;
                            n_water=1.33, sigma=0.0, σ_blur=0.0,
-                           λ_energy=0.0, λ_smooth=0.0)
+                           λ_energy=0.0, λ_smooth=0.0,
+                           loss_type::Symbol=:cosine, σ_ssim=nothing)
     n_act = length(prop.sim.actuators)
     n_freq = length(ω_freqs)
     t_grid = prop.t_grid
@@ -422,6 +708,7 @@ function make_caustic_loss(prop::Propagator, T_time::Real,
 
     # Pre-blur target once (constant w.r.t. params)
     T_b = gaussian_blur(Float64.(target), dx, dy, σ_blur)
+    norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
 
     function loss(params::AbstractVector)
         A_mat, φ_mat = unpack_params(params, n_act, n_freq)
@@ -431,11 +718,9 @@ function make_caustic_loss(prop::Propagator, T_time::Real,
         a = evaluate_modal_amplitudes(prop, T_time, Q)
         _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
 
-        # Term 1: cosine similarity (scale-invariant pattern match)
-        dot_IT = sum(I .* T_b)
-        norm_I = sqrt(sum(I .^ 2) + 1e-12)
-        norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
-        L_match = 1 - dot_IT / (norm_I * norm_T)
+        # Term 1: image match
+        L_match = loss_type == :ssim ? _ssim_loss(I, T_b, dx, dy; σ_ssim) :
+                                       _cosine_loss(I, T_b, norm_T)
 
         # Term 2: energy penalty Σ A²
         L_energy = sum(A_mat .^ 2)
@@ -461,13 +746,19 @@ every call (since `σ_blur` changes over time).
 function make_caustic_loss_refining(prop::Propagator, T_time::Real,
                                     target::Matrix{<:Real}, ω_freqs::AbstractVector,
                                     sigma_ref::Ref{Float64}, σ_blur_ref::Ref{Float64};
-                                    n_water=1.33, λ_energy=0.0, λ_smooth=0.0)
+                                    n_water=1.33, λ_energy=0.0, λ_smooth=0.0,
+                                    loss_type::Symbol=:cosine, σ_ssim=nothing)
     n_act = length(prop.sim.actuators)
     n_freq = length(ω_freqs)
     t_grid = prop.t_grid
     dx = prop.xs[2] - prop.xs[1]
     dy = prop.ys[2] - prop.ys[1]
     target_f64 = Float64.(target)
+
+    # Cache blurred target and its norm
+    cached_σ_blur = Ref(-1.0)
+    cached_T_b = Ref(target_f64)
+    cached_norm_T = Ref(sqrt(sum(target_f64 .^ 2) + 1e-12))
 
     function loss(params::AbstractVector)
         A_mat, φ_mat = unpack_params(params, n_act, n_freq)
@@ -481,14 +772,20 @@ function make_caustic_loss_refining(prop::Propagator, T_time::Real,
         a = evaluate_modal_amplitudes(prop, T_time, Q)
         _, _, I = caustic_image(prop, a; n_water=n_water, sigma=sigma)
 
-        # Re-blur target each call since σ_blur changes over time
-        T_b = gaussian_blur(target_f64, dx, dy, σ_blur)
+        # Recompute blurred target only when σ_blur changes
+        T_b = Zygote.ignore() do
+            if σ_blur != cached_σ_blur[]
+                cached_σ_blur[] = σ_blur
+                cached_T_b[] = gaussian_blur(target_f64, dx, dy, σ_blur)
+                cached_norm_T[] = sqrt(sum(cached_T_b[] .^ 2) + 1e-12)
+            end
+            cached_T_b[]
+        end
+        norm_T = Zygote.ignore() do; cached_norm_T[] end
 
-        # Term 1: cosine similarity (scale-invariant pattern match)
-        dot_IT = sum(I .* T_b)
-        norm_I = sqrt(sum(I .^ 2) + 1e-12)
-        norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
-        L_match = 1 - dot_IT / (norm_I * norm_T)
+        # Term 1: image match
+        L_match = loss_type == :ssim ? _ssim_loss(I, T_b, dx, dy; σ_ssim) :
+                                       _cosine_loss(I, T_b, norm_T)
 
         # Term 2: energy penalty Σ A²
         L_energy = sum(A_mat .^ 2)
@@ -497,6 +794,166 @@ function make_caustic_loss_refining(prop::Propagator, T_time::Real,
         L_smooth = 0.5 * sum((A_mat .* ω_freqs') .^ 2)
 
         return L_match + λ_energy * L_energy + λ_smooth * L_smooth
+    end
+
+    return loss
+end
+
+# ── Steady-state differentiable loss factories ──────────────────────
+
+"""
+    make_caustic_loss_ss(prop, T, target, Ω_freqs; ...) → loss(params)
+
+Steady-state version of `make_caustic_loss`. Parameters are complex phasors
+packed as [vec(Re(P)); vec(Im(P))]. The pipeline is:
+
+    params → P_complex → a (via transfer function) → I → L
+
+The wave physics is **linear** in parameters — only the optics is nonlinear.
+"""
+function make_caustic_loss_ss(prop::Propagator, T_time::Real,
+                               target::Matrix{<:Real}, Ω_freqs::AbstractVector;
+                               n_water=1.33, sigma=0.0, σ_blur=0.0,
+                               λ_energy=0.0,
+                               loss_type::Symbol=:cosine, σ_ssim=nothing,
+                               n_temporal::Int=1, σ_temporal::Float64=0.0,
+                               λ_temporal::Float64=0.0)
+    n_act = length(prop.sim.actuators)
+    n_freq = length(Ω_freqs)
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+
+    # Pre-blur target once (constant w.r.t. params)
+    T_b = gaussian_blur(Float64.(target), dx, dy, σ_blur)
+    norm_T = sqrt(sum(T_b .^ 2) + 1e-12)
+
+    # Pre-compute transfer matrix (constant w.r.t. params)
+    γ = prop.sim.tank.damping
+    H = transfer_matrix(prop.ω, Ω_freqs, γ)
+
+    # Precompute temporal sample offsets and weights
+    δs, ws = if n_temporal > 1
+        δs_ = collect(range(-3σ_temporal, 3σ_temporal, length=n_temporal))
+        ws_ = [exp(-δ^2 / (2 * σ_temporal^2 + 1e-30)) for δ in δs_]
+        ws_ ./= sum(ws_)
+        (δs_, ws_)
+    else
+        (Float64[0.0], Float64[1.0])
+    end
+
+    function loss(params::AbstractVector)
+        X, Y = unpack_complex(params, n_act, n_freq)
+        P = X .+ im .* Y
+
+        # Steady-state modal amplitudes (linear in P)
+        α = H .* (prop.C * P)                       # [n_modes × n_freq]
+
+        # Image match: weighted sum over time samples
+        L_match = zero(eltype(params))
+        for k in 1:length(δs)
+            E_k = exp.(im .* Ω_freqs .* (T_time + δs[k]))
+            a_k = imag(α * E_k)
+            _, _, I_k = caustic_image(prop, a_k; n_water=n_water, sigma=sigma)
+            L_k = loss_type == :ssim ? _ssim_loss(I_k, T_b, dx, dy; σ_ssim) :
+                                       _cosine_loss(I_k, T_b, norm_T)
+            L_match = L_match + ws[k] * L_k
+        end
+
+        # Temporal gradient penalty: ‖da/dt‖² at T
+        if λ_temporal > 0
+            E_T = exp.(im .* Ω_freqs .* T_time)
+            dadt = real(α * (im .* Ω_freqs .* E_T))
+            L_match = L_match + λ_temporal * sum(dadt .^ 2)
+        end
+
+        # Energy penalty on phasor magnitudes
+        L_energy = sum(X .^ 2) + sum(Y .^ 2)
+
+        return L_match + λ_energy * L_energy
+    end
+
+    return loss
+end
+
+"""
+    make_caustic_loss_ss_refining(prop, T, target, Ω_freqs,
+                                  sigma_ref, σ_blur_ref; ...) → loss(params)
+
+Steady-state version with mutable sigma refs for coarse-to-fine annealing.
+"""
+function make_caustic_loss_ss_refining(prop::Propagator, T_time::Real,
+                                       target::Matrix{<:Real}, Ω_freqs::AbstractVector,
+                                       sigma_ref::Ref{Float64}, σ_blur_ref::Ref{Float64};
+                                       n_water=1.33, λ_energy=0.0,
+                                       loss_type::Symbol=:cosine, σ_ssim=nothing,
+                                       n_temporal::Int=1, σ_temporal::Float64=0.0,
+                                       λ_temporal::Float64=0.0)
+    n_act = length(prop.sim.actuators)
+    n_freq = length(Ω_freqs)
+    dx = prop.xs[2] - prop.xs[1]
+    dy = prop.ys[2] - prop.ys[1]
+    target_f64 = Float64.(target)
+
+    γ = prop.sim.tank.damping
+    H = transfer_matrix(prop.ω, Ω_freqs, γ)
+
+    # Cache blurred target and its norm
+    cached_σ_blur = Ref(-1.0)
+    cached_T_b = Ref(target_f64)
+    cached_norm_T = Ref(sqrt(sum(target_f64 .^ 2) + 1e-12))
+
+    # Precompute temporal sample offsets and weights
+    δs, ws = if n_temporal > 1
+        δs_ = collect(range(-3σ_temporal, 3σ_temporal, length=n_temporal))
+        ws_ = [exp(-δ^2 / (2 * σ_temporal^2 + 1e-30)) for δ in δs_]
+        ws_ ./= sum(ws_)
+        (δs_, ws_)
+    else
+        (Float64[0.0], Float64[1.0])
+    end
+
+    function loss(params::AbstractVector)
+        X, Y = unpack_complex(params, n_act, n_freq)
+        P = X .+ im .* Y
+
+        sigma = sigma_ref[]
+        σ_blur = σ_blur_ref[]
+
+        # Steady-state modal amplitudes
+        α = H .* (prop.C * P)
+
+        # Recompute blurred target only when σ_blur changes
+        T_b = Zygote.ignore() do
+            if σ_blur != cached_σ_blur[]
+                cached_σ_blur[] = σ_blur
+                cached_T_b[] = gaussian_blur(target_f64, dx, dy, σ_blur)
+                cached_norm_T[] = sqrt(sum(cached_T_b[] .^ 2) + 1e-12)
+            end
+            cached_T_b[]
+        end
+        norm_T = Zygote.ignore() do; cached_norm_T[] end
+
+        # Image match: weighted sum over time samples
+        L_match = zero(eltype(params))
+        for k in 1:length(δs)
+            E_k = exp.(im .* Ω_freqs .* (T_time + δs[k]))
+            a_k = imag(α * E_k)
+            _, _, I_k = caustic_image(prop, a_k; n_water=n_water, sigma=sigma)
+            L_k = loss_type == :ssim ? _ssim_loss(I_k, T_b, dx, dy; σ_ssim) :
+                                       _cosine_loss(I_k, T_b, norm_T)
+            L_match = L_match + ws[k] * L_k
+        end
+
+        # Temporal gradient penalty: ‖da/dt‖² at T
+        if λ_temporal > 0
+            E_T = exp.(im .* Ω_freqs .* T_time)
+            dadt = real(α * (im .* Ω_freqs .* E_T))
+            L_match = L_match + λ_temporal * sum(dadt .^ 2)
+        end
+
+        L_energy = sum(X .^ 2) + sum(Y .^ 2)
+
+        return L_match + λ_energy * L_energy
     end
 
     return loss
