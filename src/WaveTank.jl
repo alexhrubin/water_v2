@@ -1,6 +1,7 @@
 module WaveTank
 
 using LinearAlgebra
+using Statistics
 using SparseArrays
 using Printf
 using Zygote
@@ -16,7 +17,7 @@ export reconstruct_surface, reconstruct_surface_hessian, snell_landing
 export caustic_image_jacobian
 export pack_complex, unpack_complex, make_caustic_loss_ss, make_caustic_loss_ss_refining
 export make_caustic_loss_ss_keyframes
-export load_target_image
+export load_target_image, analyze_target, setup_from_target, analytical_solve
 
 # ── Data structures ──────────────────────────────────────────────────
 
@@ -1256,6 +1257,316 @@ function load_target_image(path::AbstractString, prop::Propagator; invert=false)
     # Normalize to [0, 1]
     target ./= max(maximum(target), 1e-10)
     return target
+end
+
+# ── Target analysis and auto-setup ────────────────────────────────────
+
+"""
+    analyze_target(target, tank; n_modes_max=50, energy_fraction=0.95) → NamedTuple
+
+Analyze a target image's spatial frequency content relative to the tank's
+modal structure. Returns suggested parameters for optimization setup.
+
+The target is projected onto the 2D cosine eigenmode basis and each mode's
+energy is mapped to the corresponding natural frequency via the dispersion
+relation.
+"""
+function analyze_target(target::Matrix{<:Real}, tank::Tank;
+                        n_modes_max::Int=50, energy_fraction::Float64=0.95)
+    Lx, Ly, depth, g = tank.Lx, tank.Ly, tank.depth, tank.g
+    nx, ny = size(target)
+
+    # Build separable cosine basis on the target's grid
+    xs = range(0, Lx, length=nx)
+    ys = range(0, Ly, length=ny)
+    # Indices 0:n_modes_max (include DC for completeness, exclude (0,0) mode later)
+    ms = 0:n_modes_max
+    ns = 0:n_modes_max
+    cos_x = [cos(m * π * x / Lx) for x in xs, m in ms]  # [nx × (n_modes_max+1)]
+    cos_y = [cos(n * π * y / Ly) for y in ys, n in ns]  # [ny × (n_modes_max+1)]
+
+    # Project target onto eigenmode basis (unnormalized inner products)
+    # coeffs[m+1, n+1] = Σ_ij target[i,j] * cos(mπx_i/Lx) * cos(nπy_j/Ly)
+    raw_coeffs = cos_x' * Float64.(target) * cos_y  # [(n_modes_max+1) × (n_modes_max+1)]
+
+    # Normalize by mode norm and grid size to get proper expansion coefficients
+    # The inner product approximation: ∫∫ f·φ dx dy ≈ (Lx/nx)·(Ly/ny) · Σ f·φ
+    dx_grid = Lx / nx
+    dy_grid = Ly / ny
+    coeffs = similar(raw_coeffs)
+    for mi in 1:n_modes_max+1, ni in 1:n_modes_max+1
+        m, n = mi - 1, ni - 1
+        Ix = m == 0 ? Lx : Lx / 2
+        Iy = n == 0 ? Ly : Ly / 2
+        N_mn = Ix * Iy
+        coeffs[mi, ni] = raw_coeffs[mi, ni] * dx_grid * dy_grid / N_mn
+    end
+    coeffs[1, 1] = 0.0  # exclude DC mode (0,0)
+
+    # Energy per mode and natural frequencies
+    energy = coeffs .^ 2
+    E_total = sum(energy)
+
+    # Compute natural frequency for each (m,n) mode
+    freq_map = zeros(n_modes_max + 1, n_modes_max + 1)
+    for mi in 1:n_modes_max+1, ni in 1:n_modes_max+1
+        m, n = mi - 1, ni - 1
+        (m == 0 && n == 0) && continue
+        k = sqrt((m * π / Lx)^2 + (n * π / Ly)^2)
+        freq_map[mi, ni] = sqrt(g * k * tanh(k * depth)) / (2π)  # Hz
+    end
+
+    # Sort modes by energy (descending), find set capturing energy_fraction
+    mode_list = [(m=mi-1, n=ni-1, E=energy[mi,ni], f=freq_map[mi,ni])
+                 for mi in 1:n_modes_max+1 for ni in 1:n_modes_max+1
+                 if !(mi == 1 && ni == 1)]
+    sort!(mode_list, by=x -> -x.E)
+
+    cumE = cumsum([m.E for m in mode_list])
+    n_needed = findfirst(>=(energy_fraction * E_total), cumE)
+    n_needed = n_needed === nothing ? length(mode_list) : n_needed
+    important_modes = mode_list[1:n_needed]
+
+    # Suggested parameters
+    m_max = maximum(m.m for m in important_modes)
+    n_max = maximum(m.n for m in important_modes)
+    freq_min = minimum(m.f for m in important_modes if m.f > 0)
+    freq_max = maximum(m.f for m in important_modes)
+    suggested_n_modes = max(m_max, n_max) + 1
+
+    # Actuator count: ~2× highest mode index per wall side, all 4 sides
+    n_act_per_side = max(m_max, n_max) + 1
+    suggested_n_act = 4 * n_act_per_side
+
+    # Suggested n_freq: roughly one per Hz in the range, at least 4
+    suggested_n_freq = max(4, round(Int, 2 * (freq_max - freq_min) + 1))
+
+    # Print summary
+    println("=" ^ 60)
+    println("  Target Analysis")
+    println("=" ^ 60)
+    println("  Grid: $(nx)×$(ny)")
+    println("  Modes capturing $(round(energy_fraction*100))% energy: $n_needed / $(length(mode_list))")
+    println("  Highest mode indices: m_max=$m_max, n_max=$n_max")
+    println("  Frequency range: $(round(freq_min, digits=2)) – $(round(freq_max, digits=2)) Hz")
+    println()
+    println("  Suggested parameters:")
+    println("    n_modes = $suggested_n_modes")
+    println("    n_freq  = $suggested_n_freq  (range $(round(freq_min, digits=2))–$(round(freq_max, digits=2)) Hz)")
+    println("    n_act   = $suggested_n_act  ($n_act_per_side per side)")
+    println()
+    println("  Top 10 modes by energy:")
+    for (i, m) in enumerate(mode_list[1:min(10, end)])
+        pct = m.E / E_total * 100
+        println("    ($( m.m), $(m.n))  f=$(round(m.f, digits=2)) Hz  energy=$(round(pct, digits=1))%")
+    end
+    println("=" ^ 60)
+
+    return (coeffs=coeffs, energy=energy, freq_map=freq_map,
+            E_total=E_total, important_modes=important_modes,
+            n_modes=suggested_n_modes, n_freq=suggested_n_freq,
+            n_act=suggested_n_act, freq_min=freq_min, freq_max=freq_max,
+            m_max=m_max, n_max=n_max, cos_x=cos_x, cos_y=cos_y)
+end
+
+"""
+    setup_from_target(target, tank; energy_fraction=0.95, nx=100, ny=100,
+                      n_modes_max=50, actuator_width=0.05,
+                      T_eval=1.0, n_water=1.33) → NamedTuple
+
+Automatically configure optimization setup from a target image. Returns:
+- `prop`: Propagator ready for optimization
+- `Ω_freqs`: driving frequencies (angular, rad/s)
+- `target_bl`: band-limited target (unachievable spatial frequencies removed)
+- `analysis`: full analysis results from `analyze_target`
+- `p0`: analytical initial guess parameter vector from `analytical_solve`
+"""
+function setup_from_target(target::Matrix{<:Real}, tank::Tank;
+                           energy_fraction::Float64=0.95, nx::Int=100, ny::Int=100,
+                           n_modes_max::Int=50, actuator_width::Float64=0.05,
+                           T_eval::Float64=1.0, n_water::Float64=1.33)
+    Lx, Ly = tank.Lx, tank.Ly
+
+    # Analyze on the target's own grid
+    analysis = analyze_target(target, tank; n_modes_max, energy_fraction)
+
+    n_modes = analysis.n_modes
+    n_freq = analysis.n_freq
+    freq_min = analysis.freq_min
+    freq_max = analysis.freq_max
+    n_act_per_side = max(analysis.m_max, analysis.n_max) + 1
+
+    # Build driving frequencies (evenly spaced in the suggested range)
+    freqs = collect(range(freq_min, freq_max, length=n_freq))
+    Ω_freqs = 2π .* freqs
+
+    # Place actuators evenly around perimeter
+    positions = Tuple{Float64,Float64}[]
+    for x in range(0, Lx, length=n_act_per_side + 2)[2:end-1]
+        push!(positions, (x, 0.0))   # bottom wall
+        push!(positions, (x, Ly))    # top wall
+    end
+    for y in range(0, Ly, length=n_act_per_side + 2)[2:end-1]
+        push!(positions, (0.0, y))   # left wall
+        push!(positions, (Lx, y))    # right wall
+    end
+    n_act = length(positions)
+
+    actuators = [
+        Actuator(pos[1], pos[2],
+                 SineSum(; freqs=freqs, A=zeros(n_freq), φ=zeros(n_freq));
+                 width=actuator_width)
+        for pos in positions
+    ]
+
+    sim = WaveSim(tank, actuators, (0.0, 5.0), 0.01; n_modes=n_modes)
+    prop = build_propagator(sim; nx=nx, ny=ny, dense_basis=false)
+
+    # Band-limit the target: reconstruct using only achievable modes
+    # Reproject onto the propagator's grid
+    cos_x_out = [cos(m * π * x / Lx) for x in prop.xs, m in 0:n_modes-1]
+    cos_y_out = [cos(n * π * y / Ly) for y in prop.ys, n in 0:n_modes-1]
+    # Use coefficients from analysis (truncated to n_modes)
+    c = analysis.coeffs[1:n_modes, 1:n_modes]
+    target_bl = cos_x_out * c * cos_y_out'
+    target_bl = max.(target_bl, 0.0)
+    bl_max = maximum(target_bl)
+    if bl_max > 0
+        target_bl ./= bl_max
+    end
+
+    println("\nSetup: $(n_act) actuators, $(n_freq) frequencies ($(round(freq_min,digits=2))–$(round(freq_max,digits=2)) Hz), $(length(prop.ω)) modes")
+    println("Grid: $(nx)×$(ny), Parameters: $(2 * n_act * n_freq)")
+
+    # Analytical solve for initial guess
+    sol = analytical_solve(prop, target_bl, Ω_freqs, T_eval; n_water=n_water)
+
+    println("Analytical solve: ‖a_desired‖ = $(round(norm(sol.a_desired), sigdigits=4)), ‖p0‖ = $(round(norm(sol.p0), sigdigits=4))")
+
+    return (prop=prop, Ω_freqs=Ω_freqs, target_bl=target_bl, analysis=analysis,
+            freqs=freqs, actuators=actuators, p0=sol.p0)
+end
+
+# ── Analytical solve ──────────────────────────────────────────────────
+
+"""
+    analytical_solve(prop, target, Ω_freqs, T_eval; n_water=1.33, max_contrast=0.5) → (p0, a_desired)
+
+Compute actuator phasors analytically from a target caustic image using the
+paraxial approximation I ≈ 1 - (depth/n_water)·∇²η.
+
+Pipeline:
+1. Project (target - 1) onto cosine eigenmodes → coefficients c_{m,n}
+2. Poisson inversion: a_{m,n} = c_{m,n} · n_water / (depth · k²_{m,n})
+3. Linear solve: find phasors P such that imag(H .* (C·P) · exp(iΩT)) = a_desired
+
+Returns a NamedTuple with:
+- `p0`: parameter vector [2·n_act·n_freq] in pack_complex format
+- `a_desired`: target modal amplitudes [n_total]
+"""
+function analytical_solve(prop::Propagator, target::Matrix{<:Real},
+                          Ω_freqs::AbstractVector, T_eval::Real;
+                          n_water::Float64=1.33, max_contrast::Float64=0.5)
+    (; sim, mode_m, mode_n, ω, C, cos_x, cos_y, xs, ys, nx, ny) = prop
+    (; Lx, Ly, depth, damping) = sim.tank
+    n_modes = sim.n_modes
+    n_total = length(ω)
+    n_act = size(C, 2)
+    n_freq = length(Ω_freqs)
+
+    @assert size(target) == (nx, ny) "Target size $(size(target)) must match propagator grid ($nx, $ny)"
+
+    # ── 1. Project (I_target - 1) onto cosine eigenmode basis ──────────
+    # The paraxial caustic formula is I ≈ 1 - (depth/n_water)·∇²η, where
+    # I is the physical intensity (= 1 for flat surface, >1 at bright caustic).
+    # The input `target` is normalized to [0,1], so we rescale to mean=1 to
+    # get the physical intensity: I_target = target / mean(target).
+    # This ensures energy conservation and the correct sign (bright → I>1 → ∇²η<0).
+    dx = Lx / nx
+    dy = Ly / ny
+    t_mean = max(mean(Float64.(target)), 1e-6)
+    residual = Float64.(target) ./ t_mean .- 1.0   # = I_target - 1, mean=0
+    raw = cos_x' * residual * cos_y   # [n_modes × n_modes]
+
+    # Normalize by grid spacing and mode norms
+    coeffs = similar(raw)
+    for mi in 1:n_modes, ni in 1:n_modes
+        m, n = mi - 1, ni - 1
+        Ix = m == 0 ? Lx : Lx / 2
+        Iy = n == 0 ? Ly : Ly / 2
+        coeffs[mi, ni] = raw[mi, ni] * dx * dy / (Ix * Iy)
+    end
+    coeffs[1, 1] = 0.0  # DC mode excluded
+
+    # ── 2. Poisson inversion: a_{m,n} = c_{m,n} · n_water / (depth · k²) ──
+    a_desired = zeros(n_total)
+    for j in 1:n_total
+        m, n = mode_m[j], mode_n[j]
+        k2 = (m * π / Lx)^2 + (n * π / Ly)^2
+        a_desired[j] = coeffs[m + 1, n + 1] * n_water / (depth * k2)
+    end
+
+    # ── 2b. Mask out modes the actuators can't drive ─────────────────
+    # High-k modes are suppressed by the Gaussian blob factor exp(-σ²k²/2).
+    # Including them in a_desired forces pinv to invert near-zero singular
+    # values, blowing up p0 without actually producing those amplitudes.
+    max_coupling = vec(maximum(abs.(C), dims=2))
+    coupling_threshold = 1e-3 * maximum(max_coupling)
+    achievable = max_coupling .>= coupling_threshold
+    n_achievable = sum(achievable)
+    a_desired .*= achievable
+    println("  Analytical solve: $(n_achievable)/$(n_total) modes achievable (coupling > 1e-3 * max)")
+
+    # ── 2c. Scale so caustic contrast ≤ max_contrast ─────────────────
+    # The caustic intensity deviation is δI = -(depth/n_water)·∇²η,
+    # and ∇²φ_{m,n} = -k²·φ_{m,n}, so we compute the implied Laplacian field.
+    a_2d = zeros(n_modes, n_modes)
+    k2_2d = zeros(n_modes, n_modes)
+    for j in 1:n_total
+        m, n = mode_m[j], mode_n[j]
+        a_2d[m + 1, n + 1] = a_desired[j]
+        k2_2d[m + 1, n + 1] = (m * π / Lx)^2 + (n * π / Ly)^2
+    end
+    lap_field = cos_x * (-k2_2d .* a_2d) * cos_y'   # ∇²η field [nx × ny]
+    caustic_dev = (depth / n_water) .* lap_field       # = I - 1 implied
+    caustic_range = maximum(abs, caustic_dev)
+    if caustic_range > max_contrast
+        scale = max_contrast / caustic_range
+        a_desired .*= scale
+        println("  Analytical solve: scaled caustic contrast $(round(caustic_range,digits=3)) → $max_contrast (scale=$(round(scale,sigdigits=3)))")
+    else
+        println("  Analytical solve: caustic contrast $(round(caustic_range,digits=3)) (within target $max_contrast)")
+    end
+
+    # ── 3. Build linear system M·θ = a_desired ────────────────────────
+    # a = imag(H .* (C * P) * exp(iΩT)) is linear in θ = [vec(X); vec(Y)]
+    H = transfer_matrix(ω, Ω_freqs, damping)   # [n_total × n_freq]
+    E = exp.(im .* Ω_freqs .* T_eval)           # [n_freq]
+    β = H .* E'                                  # [n_total × n_freq], β_{j,k} = H_{j,k}·e^{iΩ_k T}
+
+    # M = [M_X  M_Y] where M_X[:,block_k] = diag(imag(β[:,k])) * C
+    #                       M_Y[:,block_k] = diag(real(β[:,k])) * C
+    # Only build rows for achievable modes to keep conditioning tractable
+    M = zeros(n_total, 2 * n_act * n_freq)
+    for k in 1:n_freq
+        col_x = (k - 1) * n_act
+        col_y = n_act * n_freq + (k - 1) * n_act
+        for j in 1:n_total
+            achievable[j] || continue
+            bI = imag(β[j, k])
+            bR = real(β[j, k])
+            for i in 1:n_act
+                M[j, col_x + i] = C[j, i] * bI
+                M[j, col_y + i] = C[j, i] * bR
+            end
+        end
+    end
+
+    # ── 4. Solve via least-squares ────────────────────────────────────
+    # rtol truncates near-zero singular values → bounded, physical p0
+    θ = pinv(M; rtol=1e-3) * a_desired
+
+    return (p0=θ, a_desired=a_desired)
 end
 
 end # module
