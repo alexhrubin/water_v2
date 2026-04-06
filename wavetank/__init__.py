@@ -53,6 +53,13 @@ from .nonideal import (
     sample_random_phasors,
     generate_training_pair,
 )
+from .correction import (
+    CorrectionUNet,
+    apply_correction,
+    generate_training_data,
+    train_correction,
+    make_corrected_loss,
+)
 
 __all__ = [
     "Tank", "Actuator", "Propagator", "build_propagator",
@@ -66,4 +73,7 @@ __all__ = [
     "sample_nonideal_config", "make_nonideal_propagator",
     "caustic_image_nonideal",
     "sample_random_phasors", "generate_training_pair",
+    "CorrectionUNet", "apply_correction",
+    "generate_training_data", "train_correction",
+    "make_corrected_loss",
 ]
