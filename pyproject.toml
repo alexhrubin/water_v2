@@ -26,6 +26,9 @@ dev = ["pytest>=8.0", "jupyter>=1.0"]
 where = ["."]
 include = ["wavetank*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.2.0",

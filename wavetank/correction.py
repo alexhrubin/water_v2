@@ -150,6 +150,34 @@ def apply_correction(model: CorrectionUNet, I: jnp.ndarray) -> jnp.ndarray:
     return I + delta[0]          # (H, W)
 
 
+# ── Serialization ────────────────────────────────────────────────────
+
+def save_model(path: str, model: CorrectionUNet) -> None:
+    """Save a trained model to disk via Equinox's leaf serialization.
+
+    Stores only the array leaves; the architecture (channel widths, etc.)
+    must be reconstructed at load time. Pair with load_model.
+    """
+    eqx.tree_serialise_leaves(path, model)
+
+
+def load_model(path: str, ch: int = 16) -> CorrectionUNet:
+    """Load a trained model from disk.
+
+    Parameters
+    ----------
+    path : file written by save_model
+    ch   : base channel count, must match what the saved model was trained with
+
+    Returns
+    -------
+    Trained CorrectionUNet with parameters loaded from disk.
+    """
+    # Build a skeleton with the right architecture, then overwrite leaves
+    skeleton = CorrectionUNet(ch=ch, key=jax.random.PRNGKey(0))
+    return eqx.tree_deserialise_leaves(path, skeleton)
+
+
 # ── Training ──────────────────────────────────────────────────────────
 
 def generate_training_data(
@@ -184,26 +212,21 @@ def generate_training_data(
     delta_Is  : (n_samples, H, W)  where delta = I_nonideal - I_ideal
     """
     n_freq = len(Omega_freqs)
-    render_kw = dict(n_water=n_water, sigma=sigma)
+    Omega_j = jnp.asarray(Omega_freqs)
 
-    I_ideals = []
-    delta_Is = []
-
-    for i in range(n_samples):
-        key, subkey = jax.random.split(key)
-        params = sample_random_phasors(subkey, prop.n_act, n_freq, scale=phasor_scale)
+    def _one_pair(k: jax.Array) -> tuple[jnp.ndarray, jnp.ndarray]:
+        params = sample_random_phasors(k, prop.n_act, n_freq, scale=phasor_scale)
         X, Y = unpack_complex(params, prop.n_act, n_freq)
         P = X + 1j * Y
+        a_ideal = steady_state_amplitudes(prop, P, Omega_j, T)
+        _, _, I_ideal = caustic_image(prop, a_ideal, n_water=n_water, sigma=sigma)
+        _, _, I_ni = caustic_image_nonideal(
+            prop, config, P, Omega_j, T, n_water=n_water, sigma=sigma)
+        return I_ideal, I_ni - I_ideal
 
-        a_ideal = steady_state_amplitudes(prop, P, Omega_freqs, T)
-        _, _, I_ideal = caustic_image(prop, a_ideal, **render_kw)
-
-        _, _, I_ni = caustic_image_nonideal(prop, config, P, Omega_freqs, T, **render_kw)
-
-        I_ideals.append(I_ideal)
-        delta_Is.append(I_ni - I_ideal)
-
-    return jnp.stack(I_ideals), jnp.stack(delta_Is)
+    keys = jax.random.split(key, n_samples)
+    I_ideals, delta_Is = jax.vmap(_one_pair)(keys)
+    return I_ideals, delta_Is
 
 
 def train_correction(

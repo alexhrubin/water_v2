@@ -41,7 +41,7 @@ def make_loss(
     prop: Propagator,
     target: np.ndarray,
     Omega_freqs: np.ndarray,
-    T_eval: float,
+    T_eval: float | Sequence[float],
     *,
     sigma: float = 0.02,
     sigma_blur: float = 0.02,
@@ -61,7 +61,10 @@ def make_loss(
     prop          : Propagator
     target        : target caustic image [nx, ny] in [0, 1]
     Omega_freqs   : driving angular frequencies [n_freq]
-    T_eval        : evaluation time (s)
+    T_eval        : evaluation time(s). Pass a scalar for single-frame
+                    optimization, or a sequence of times to optimize the
+                    average loss over a "movie" of frames — useful for
+                    making the target persist throughout one period.
     sigma         : rendering blur
     sigma_blur    : target pre-blur (0 = no blur)
     loss_type     : 'cosine' or 'ssim'
@@ -88,22 +91,41 @@ def make_loss(
 
     Omega = jnp.asarray(Omega_freqs)
 
+    # Movie mode: T_eval is an array → average loss over multiple frames.
+    movie_mode = not np.isscalar(T_eval)
+    if movie_mode:
+        T_array = jnp.asarray(T_eval)
+    else:
+        T_scalar = float(T_eval)
+
+    def _frame_loss(I: jnp.ndarray) -> jnp.ndarray:
+        if loss_type == 'cosine':
+            dot = jnp.sum(I * T_b)
+            norm_I = jnp.sqrt(jnp.sum(I ** 2) + 1e-12)
+            return 1.0 - dot / (norm_I * norm_T)
+        elif loss_type == 'ssim':
+            return ssim_loss(I, T_b, dx, dy)
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type!r}")
+
     def loss_fn(params: jnp.ndarray) -> jnp.ndarray:
         X, Y = unpack_complex(params, n_act, n_freq)
         P = X + 1j * Y                                             # [n_act, n_freq]
-        a = steady_state_amplitudes(prop, P, Omega, T_eval)        # [n_total]
-        _, _, I = caustic_image(prop, a,
-                                n_water=n_water, sigma=sigma,
-                                full_snell=full_snell)             # [nx, ny]
 
-        if loss_type == 'cosine':
-            dot = jnp.sum(I * T_b)
-            norm_I = jnp.sqrt(jnp.sum(I**2) + 1e-12)
-            L_match = 1.0 - dot / (norm_I * norm_T)
-        elif loss_type == 'ssim':
-            L_match = ssim_loss(I, T_b, dx, dy)
+        if movie_mode:
+            def per_frame(t):
+                a = steady_state_amplitudes(prop, P, Omega, t)
+                _, _, I = caustic_image(prop, a,
+                                        n_water=n_water, sigma=sigma,
+                                        full_snell=full_snell)
+                return _frame_loss(I)
+            L_match = jnp.mean(jax.vmap(per_frame)(T_array))
         else:
-            raise ValueError(f"Unknown loss_type: {loss_type!r}")
+            a = steady_state_amplitudes(prop, P, Omega, T_scalar)
+            _, _, I = caustic_image(prop, a,
+                                    n_water=n_water, sigma=sigma,
+                                    full_snell=full_snell)
+            L_match = _frame_loss(I)
 
         L_energy = jnp.sum(X**2) + jnp.sum(Y**2)
         return L_match + lambda_energy * L_energy
@@ -117,7 +139,7 @@ def optimize_caustic(
     prop: Propagator,
     target: np.ndarray,
     Omega_freqs: np.ndarray,
-    T_eval: float,
+    T_eval: float | Sequence[float],
     *,
     stages: Sequence[Stage] = (
         Stage(sigma=0.04, sigma_blur=0.04, iters=500),
@@ -141,7 +163,9 @@ def optimize_caustic(
     prop        : Propagator
     target      : target image [nx, ny], values in [0, 1]
     Omega_freqs : driving angular frequencies [n_freq]
-    T_eval      : evaluation time (s)
+    T_eval      : scalar evaluation time, or a sequence of times for movie
+                  mode (averages the loss over all frames so the target
+                  pattern persists throughout one period).
     stages      : sequence of Stage(sigma, sigma_blur, iters)
     lr          : Adam learning rate
     lambda_energy: L2 regularization on phasor amplitudes

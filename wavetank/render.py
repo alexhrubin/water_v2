@@ -124,7 +124,7 @@ def snell_landing(
     dt_y = coeff * ny_s
     dt_z = -ratio + coeff * nz_s
 
-    t_hit = -depth / dt_z
+    t_hit = -(depth - eta) / dt_z
     return X_src + dt_x * t_hit, Y_src + dt_y * t_hit
 
 
@@ -358,12 +358,23 @@ def _caustic_bwd(prop, n_water, sigma, cutoff_sigmas, full_snell, residuals, g):
     dL_dxl, dL_dyl = _bilinear_splat_adjoint(dL_dD, ix0, iy0, wx, wy, mask,
                                               dx, dy)
 
-    # ── Step 4 adjoint: paraxial refraction ──────────────────────────
-    inv_n = 1.0 / n_water_r
-    scale = (depth - eta) * inv_n
-    dL_detax = dL_dxl * scale
-    dL_detay = dL_dyl * scale
-    dL_deta  = -dL_dxl * deta_dx * inv_n - dL_dyl * deta_dy * inv_n
+    # ── Step 4 adjoint: refraction ──────────────────────────────────
+    if full_snell:
+        # Use JAX autodiff through full vector Snell's law.
+        # This avoids hand-deriving the complex Snell adjoint while
+        # keeping the rest of the backward pass analytical.
+        X_src = jnp.asarray(prop.X_src)
+        Y_src = jnp.asarray(prop.Y_src)
+        def _snell_fn(eta_, dx_, dy_):
+            return snell_landing(X_src, Y_src, eta_, dx_, dy_, depth, n_water_r)
+        _, vjp_fn = jax.vjp(_snell_fn, eta, deta_dx, deta_dy)
+        dL_deta, dL_detax, dL_detay = vjp_fn((dL_dxl, dL_dyl))
+    else:
+        inv_n = 1.0 / n_water_r
+        scale = (depth - eta) * inv_n
+        dL_detax = dL_dxl * scale
+        dL_detay = dL_dyl * scale
+        dL_deta  = -dL_dxl * deta_dx * inv_n - dL_dyl * deta_dy * inv_n
 
     # ── Step 3 adjoint: surface reconstruction ───────────────────────
     dL_da = _reconstruct_adjoint(prop, dL_deta, dL_detax, dL_detay)

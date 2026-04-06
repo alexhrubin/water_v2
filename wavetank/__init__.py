@@ -59,6 +59,8 @@ from .correction import (
     generate_training_data,
     train_correction,
     make_corrected_loss,
+    save_model,
+    load_model,
 )
 
 __all__ = [
@@ -75,5 +77,5 @@ __all__ = [
     "sample_random_phasors", "generate_training_pair",
     "CorrectionUNet", "apply_correction",
     "generate_training_data", "train_correction",
-    "make_corrected_loss",
+    "make_corrected_loss", "save_model", "load_model",
 ]
