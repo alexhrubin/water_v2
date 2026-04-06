@@ -44,6 +44,15 @@ from .analytical import (
     analytical_solve,
     setup_from_target,
 )
+from .nonideal import (
+    NonIdealHyperparams,
+    NonIdealConfig,
+    sample_nonideal_config,
+    make_nonideal_propagator,
+    caustic_image_nonideal,
+    sample_random_phasors,
+    generate_training_pair,
+)
 
 __all__ = [
     "Tank", "Actuator", "Propagator", "build_propagator",
@@ -53,4 +62,8 @@ __all__ = [
     "cosine_loss", "ssim_loss", "load_target_image",
     "Stage", "make_loss", "optimize_caustic",
     "analyze_target", "analytical_solve", "setup_from_target",
+    "NonIdealHyperparams", "NonIdealConfig",
+    "sample_nonideal_config", "make_nonideal_propagator",
+    "caustic_image_nonideal",
+    "sample_random_phasors", "generate_training_pair",
 ]
