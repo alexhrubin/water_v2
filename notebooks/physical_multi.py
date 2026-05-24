@@ -242,7 +242,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False):
     ys = np.linspace(0, LY, NY)
 
     n = len(TARGETS)
-    fig, axes = plt.subplots(n, 2, figsize=(10, 4.5 * n))
+    # 3 columns: target | optimized (honest scale) | optimized (contrast-stretched)
+    fig, axes = plt.subplots(n, 3, figsize=(13.5, 4.5 * n))
     if n == 1:
         axes = axes[None, :]
 
@@ -253,15 +254,25 @@ def main(loss_type='cosine', depth_override=None, no_caps=False):
             depth_override=depth_override, lambda_caps=lambda_caps,
         )
         depth_used = depth_override if depth_override is not None else cfg.depth
-        axes[i, 0].imshow(target,  cmap="inferno")
+
+        # Contrast-stretched view: per-image min-max → [0, 1]. Makes tiny
+        # contrast variations visible (relevant for cap-on shallow runs
+        # where physically-achievable contrast is sub-1%).
+        I_stretched = (I_show - I_show.min()) / max(I_show.max() - I_show.min(), 1e-9)
+        contrast_pct = 100.0 * (I_show.max() - I_show.min())
+
+        axes[i, 0].imshow(target,      cmap="inferno")
         axes[i, 0].set_title(f"target: {cfg.name}\n(depth={depth_used}m)")
-        axes[i, 1].imshow(I_show,  cmap="inferno")
-        axes[i, 1].set_title(f"optimized ({loss_type}, "
-                             f"{'no caps' if no_caps else 'caps on'})   cos={cs:.3f}")
+        axes[i, 1].imshow(I_show,      cmap="inferno", vmin=0, vmax=1)
+        axes[i, 1].set_title(f"honest scale [0,1]\ncos={cs:.3f}")
+        axes[i, 2].imshow(I_stretched, cmap="inferno")
+        axes[i, 2].set_title(f"contrast-stretched\n(actual range = {contrast_pct:.1f}% of full)")
         for ax in axes[i]:
             ax.axis("off")
         summary.append((cfg.name, depth_used, ws_cos, cs, elapsed))
 
+    fig.suptitle(f"loss={loss_type}, depth_override={depth_override}, "
+                 f"{'NO caps' if no_caps else 'caps ENFORCED'}", fontsize=11)
     fig.tight_layout()
     out_png = out_dir / "comparison.png"
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
