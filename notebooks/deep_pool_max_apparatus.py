@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import jax
+jax.config.update('jax_enable_x64', True)   # matches deep_pool_examples.py
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -61,15 +62,16 @@ SIGMA_TEMPORAL = 0.033
 # Cap enforcement (NOT in example.ipynb)
 LAMBDA_ETA     = 100.0
 LAMBDA_SLOPE   = 100.0
-LAMBDA_ENERGY  = 1e-5
+LAMBDA_ENERGY  = 1e-6        # matches deep_pool_examples.py
 
-# Optimization
-LR             = 1e-3
+# Optimization — L-BFGS, full Snell, matching the deep_pool baseline
+LR             = 1e-3        # ignored by L-BFGS but optimize_caustic API wants it
 STAGES = (
-    Stage(sigma=0.04, sigma_blur=0.04, iters=500),
-    Stage(sigma=0.02, sigma_blur=0.02, iters=500),
-    Stage(sigma=0.01, sigma_blur=0.01, iters=500),
+    Stage(sigma=0.04, sigma_blur=0.04, iters=500, method='lbfgs'),
+    Stage(sigma=0.02, sigma_blur=0.02, iters=500, method='lbfgs'),
+    Stage(sigma=0.01, sigma_blur=0.01, iters=500, method='lbfgs'),
 )
+FULL_SNELL = True            # matches deep_pool_examples.py
 
 TARGETS_DIR = Path("targets")
 OUT_DIR     = Path("data/deep_pool_max")
@@ -170,6 +172,7 @@ def main():
             lambda_slope=LAMBDA_SLOPE,
             lambda_energy=LAMBDA_ENERGY,
             loss_type='cosine',
+            full_snell=FULL_SNELL,
             p0=p0,
             check_validity=True,
         )
