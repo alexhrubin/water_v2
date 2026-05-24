@@ -144,7 +144,7 @@ TARGETS = [
 ]
 
 
-def build_setup(depth):
+def build_setup(depth, n_modes=N_MODES):
     tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING)
     acts = []
     for i in range(N_ACT_PER_SIDE):
@@ -155,7 +155,7 @@ def build_setup(depth):
             Actuator(x=t * LX,     y=0.0),
             Actuator(x=t * LX,     y=LY),
         ]
-    prop  = build_propagator(tank, acts, n_modes=N_MODES, nx=NX, ny=NY)
+    prop  = build_propagator(tank, acts, n_modes=n_modes, nx=NX, ny=NY)
     Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(FREQ_MIN_HZ, FREQ_MAX_HZ, N_FREQ)])
     return prop, Omega
 
@@ -172,11 +172,11 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 
 
 def run_one(cfg, xs, ys, loss_type='cosine',
-            depth_override=None, lambda_caps=LAMBDA_ETA):
+            depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
-    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, loss={loss_type}, caps={caps_str})\n{'='*60}", flush=True)
-    prop, Omega = build_setup(depth)
+    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², loss={loss_type}, caps={caps_str})\n{'='*60}", flush=True)
+    prop, Omega = build_setup(depth, n_modes=n_modes)
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
@@ -220,17 +220,18 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     return target, I_show, ws_cos, cs, elapsed
 
 
-def main(loss_type='cosine', depth_override=None, no_caps=False):
+def main(loss_type='cosine', depth_override=None, no_caps=False, n_modes=N_MODES):
     lambda_caps = 0.0 if no_caps else LAMBDA_ETA
     caps_tag = "nocaps" if no_caps else f"caps{LAMBDA_ETA:g}"
     depth_tag = f"d{depth_override}" if depth_override is not None else "dauto"
-    tag = f"{loss_type}_{depth_tag}_{caps_tag}"
+    modes_tag = f"m{n_modes}" if n_modes != N_MODES else ""
+    tag = f"{loss_type}_{depth_tag}_{caps_tag}" + (f"_{modes_tag}" if modes_tag else "")
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"JAX {jax.__version__} on {jax.default_backend()}", flush=True)
     print(f"Apparatus: actuators={4 * N_ACT_PER_SIDE}, freqs={N_FREQ}, "
-          f"modes={N_MODES}², grid={NX}×{NY}")
+          f"modes={n_modes}², grid={NX}×{NY}")
     print(f"Optimizer: L-BFGS, full Snell, "
           f"λ_eta=λ_slope={lambda_caps} ({'caps OFF' if no_caps else 'caps ENFORCED'})")
     print(f"Loss: {loss_type}")
@@ -252,6 +253,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False):
         target, I_show, ws_cos, cs, elapsed = run_one(
             cfg, xs, ys, loss_type=loss_type,
             depth_override=depth_override, lambda_caps=lambda_caps,
+            n_modes=n_modes,
         )
         depth_used = depth_override if depth_override is not None else cfg.depth
 
@@ -293,5 +295,10 @@ if __name__ == "__main__":
                         help="Override per-target depth (m) — same depth for all targets.")
     parser.add_argument('--no_caps', action='store_true',
                         help="Disable linearity-cap penalties (matches example.ipynb).")
+    parser.add_argument('--n_modes', type=int, default=N_MODES,
+                        help=f"Modes per axis (default {N_MODES}). "
+                             "Raising this increases curvature budget at "
+                             "fixed slope cap (k_max·s_max grows linearly).")
     args = parser.parse_args()
-    main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps)
+    main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
+         n_modes=args.n_modes)
