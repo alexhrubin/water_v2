@@ -144,11 +144,12 @@ TARGETS = [
 ]
 
 
-def build_setup(depth, n_modes=N_MODES):
+def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
+                freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
     tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING)
     acts = []
-    for i in range(N_ACT_PER_SIDE):
-        t = (i + 1) / (N_ACT_PER_SIDE + 1)
+    for i in range(n_act_per_side):
+        t = (i + 1) / (n_act_per_side + 1)
         acts += [
             Actuator(x=0.0,        y=t * LY),
             Actuator(x=LX,         y=t * LY),
@@ -156,7 +157,7 @@ def build_setup(depth, n_modes=N_MODES):
             Actuator(x=t * LX,     y=LY),
         ]
     prop  = build_propagator(tank, acts, n_modes=n_modes, nx=NX, ny=NY)
-    Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(FREQ_MIN_HZ, FREQ_MAX_HZ, N_FREQ)])
+    Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(FREQ_MIN_HZ, freq_max, n_freq)])
     return prop, Omega
 
 
@@ -172,11 +173,15 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 
 
 def run_one(cfg, xs, ys, loss_type='cosine',
-            depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES):
+            depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
+            n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
-    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², loss={loss_type}, caps={caps_str})\n{'='*60}", flush=True)
-    prop, Omega = build_setup(depth, n_modes=n_modes)
+    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², "
+          f"act={n_act_per_side}/side, freq=[{FREQ_MIN_HZ}-{freq_max}Hz]×{n_freq}, "
+          f"loss={loss_type}, caps={caps_str})\n{'='*60}", flush=True)
+    prop, Omega = build_setup(depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
+                              freq_max=freq_max, n_freq=n_freq)
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
@@ -220,18 +225,28 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     return target, I_show, ws_cos, cs, elapsed
 
 
-def main(loss_type='cosine', depth_override=None, no_caps=False, n_modes=N_MODES):
+def main(loss_type='cosine', depth_override=None, no_caps=False,
+         n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
+         freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
     lambda_caps = 0.0 if no_caps else LAMBDA_ETA
     caps_tag = "nocaps" if no_caps else f"caps{LAMBDA_ETA:g}"
     depth_tag = f"d{depth_override}" if depth_override is not None else "dauto"
-    modes_tag = f"m{n_modes}" if n_modes != N_MODES else ""
-    tag = f"{loss_type}_{depth_tag}_{caps_tag}" + (f"_{modes_tag}" if modes_tag else "")
+    parts = [loss_type, depth_tag, caps_tag]
+    if n_modes != N_MODES:
+        parts.append(f"m{n_modes}")
+    if n_act_per_side != N_ACT_PER_SIDE:
+        parts.append(f"a{n_act_per_side}")
+    if freq_max != FREQ_MAX_HZ or n_freq != N_FREQ:
+        parts.append(f"f{freq_max:g}x{n_freq}")
+    tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"JAX {jax.__version__} on {jax.default_backend()}", flush=True)
-    print(f"Apparatus: actuators={4 * N_ACT_PER_SIDE}, freqs={N_FREQ}, "
+    print(f"Apparatus: actuators={4 * n_act_per_side} ({n_act_per_side}/side), "
+          f"freqs={n_freq} [{FREQ_MIN_HZ}-{freq_max}Hz], "
           f"modes={n_modes}², grid={NX}×{NY}")
+    print(f"Phasor DOFs: {2 * 4 * n_act_per_side * n_freq}")
     print(f"Optimizer: L-BFGS, full Snell, "
           f"λ_eta=λ_slope={lambda_caps} ({'caps OFF' if no_caps else 'caps ENFORCED'})")
     print(f"Loss: {loss_type}")
@@ -253,7 +268,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False, n_modes=N_MODES
         target, I_show, ws_cos, cs, elapsed = run_one(
             cfg, xs, ys, loss_type=loss_type,
             depth_override=depth_override, lambda_caps=lambda_caps,
-            n_modes=n_modes,
+            n_modes=n_modes, n_act_per_side=n_act_per_side,
+            freq_max=freq_max, n_freq=n_freq,
         )
         depth_used = depth_override if depth_override is not None else cfg.depth
 
@@ -297,8 +313,16 @@ if __name__ == "__main__":
                         help="Disable linearity-cap penalties (matches example.ipynb).")
     parser.add_argument('--n_modes', type=int, default=N_MODES,
                         help=f"Modes per axis (default {N_MODES}). "
-                             "Raising this increases curvature budget at "
-                             "fixed slope cap (k_max·s_max grows linearly).")
+                             "Raises curvature budget at fixed slope cap.")
+    parser.add_argument('--n_act_per_side', type=int, default=N_ACT_PER_SIDE,
+                        help=f"Actuators per side (default {N_ACT_PER_SIDE}). "
+                             "Raises rank of actuator coupling matrix.")
+    parser.add_argument('--freq_max', type=float, default=FREQ_MAX_HZ,
+                        help=f"Max driving frequency Hz (default {FREQ_MAX_HZ}). "
+                             "Higher freqs resonantly excite higher-k modes.")
+    parser.add_argument('--n_freq', type=int, default=N_FREQ,
+                        help=f"Number of driving frequencies (default {N_FREQ}).")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
-         n_modes=args.n_modes)
+         n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
+         freq_max=args.freq_max, n_freq=args.n_freq)
