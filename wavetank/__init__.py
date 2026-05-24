@@ -31,6 +31,7 @@ from .render import (
 )
 from .loss import (
     cosine_loss,
+    pearson_loss,
     ssim_loss,
     load_target_image,
 )
@@ -89,7 +90,7 @@ __all__ = [
     "transfer_matrix", "steady_state_amplitudes",
     "pack_complex", "unpack_complex",
     "reconstruct_surface", "caustic_image", "snell_landing",
-    "cosine_loss", "ssim_loss", "load_target_image",
+    "cosine_loss", "pearson_loss", "ssim_loss", "load_target_image",
     "Stage", "make_loss", "optimize_caustic", "surface_validity_report",
     "make_hos_forward",
     "analyze_target", "analytical_solve", "setup_from_target",

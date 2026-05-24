@@ -12,6 +12,7 @@ Apparatus shared (matches example.ipynb except for depth): 48 actuators, 24 freq
 15 modes/axis, 200×200 grid. Per-target: depth, optimization recipe.
 """
 
+import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,8 +171,8 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
     return list(t_eval + np.linspace(-sigma_temporal, sigma_temporal, n_temporal))
 
 
-def run_one(cfg, xs, ys):
-    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={cfg.depth}m)\n{'='*60}", flush=True)
+def run_one(cfg, xs, ys, loss_type='cosine'):
+    print(f"\n{'='*60}\n  Target: {cfg.name} (depth={cfg.depth}m, loss={loss_type})\n{'='*60}", flush=True)
     prop, Omega = build_setup(cfg.depth)
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
@@ -197,7 +198,7 @@ def run_one(cfg, xs, ys):
         lambda_eta=LAMBDA_ETA,
         lambda_slope=LAMBDA_SLOPE,
         lambda_energy=LAMBDA_ENERGY,
-        loss_type='cosine',
+        loss_type=loss_type,
         full_snell=FULL_SNELL,
         p0=p0,
         check_validity=True,
@@ -216,13 +217,14 @@ def run_one(cfg, xs, ys):
     return target, I_show, ws_cos, cs, elapsed
 
 
-def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(loss_type='cosine'):
+    out_dir = OUT_DIR / loss_type
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"JAX {jax.__version__} on {jax.default_backend()}", flush=True)
     print(f"Apparatus (per target): actuators={4 * N_ACT_PER_SIDE}, freqs={N_FREQ}, "
           f"modes={N_MODES}², grid={NX}×{NY}")
-    print(f"Optimizer: L-BFGS, full Snell, λ_eta=λ_slope={LAMBDA_ETA} (caps ENFORCED)\n",
-          flush=True)
+    print(f"Optimizer: L-BFGS, full Snell, λ_eta=λ_slope={LAMBDA_ETA} (caps ENFORCED)")
+    print(f"Loss: {loss_type}\n", flush=True)
 
     xs = np.linspace(0, LX, NX)
     ys = np.linspace(0, LY, NY)
@@ -234,25 +236,31 @@ def main():
 
     summary = []
     for i, cfg in enumerate(TARGETS):
-        target, I_show, ws_cos, cs, elapsed = run_one(cfg, xs, ys)
+        target, I_show, ws_cos, cs, elapsed = run_one(cfg, xs, ys, loss_type=loss_type)
         axes[i, 0].imshow(target,  cmap="inferno")
         axes[i, 0].set_title(f"target: {cfg.name}\n(depth={cfg.depth}m)")
         axes[i, 1].imshow(I_show,  cmap="inferno")
-        axes[i, 1].set_title(f"optimized (caps ON)   cos={cs:.3f}")
+        axes[i, 1].set_title(f"optimized (loss={loss_type})   cos={cs:.3f}")
         for ax in axes[i]:
             ax.axis("off")
         summary.append((cfg.name, cfg.depth, ws_cos, cs, elapsed))
 
     fig.tight_layout()
-    out_png = OUT_DIR / "comparison.png"
+    out_png = out_dir / "comparison.png"
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
     print(f"\nSaved {out_png}")
 
-    print(f"\n{'='*60}\n  Summary (physical regime, caps enforced)\n{'='*60}")
+    print(f"\n{'='*60}\n  Summary (loss={loss_type}, caps enforced)\n{'='*60}")
     print(f"  {'target':<20} {'depth (m)':>10} {'ws cos':>8} {'final cos':>10} {'time (s)':>10}")
     for name, d, wcos, cs, elapsed in summary:
         print(f"  {name:<20} {d:>10.1f} {wcos:>8.3f} {cs:>10.3f} {elapsed:>10.1f}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--loss', choices=['cosine', 'pearson', 'ssim'],
+                        default='cosine',
+                        help="Loss function. 'pearson' is offset-invariant, "
+                             "matches the achievable-contrast story.")
+    args = parser.parse_args()
+    main(loss_type=args.loss)

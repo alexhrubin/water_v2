@@ -15,12 +15,40 @@ def cosine_loss(I: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     """
     1 - cosine_similarity(I, target).
 
-    Invariant to absolute brightness: only the spatial pattern matters.
-    Minimum is 0 (perfect match), maximum is 2 (anti-correlated).
+    Invariant to absolute brightness scale: only the spatial pattern
+    matters. Minimum is 0 (perfect match), maximum is 2 (anti-correlated).
+
+    Caveat: cosine is *not* offset-invariant. If the physically-achievable
+    rendering has elevated background (e.g. bright spots barely above a
+    bright background) while the target has zero background, cosine loss
+    will penalize the offset heavily even when the spatial structure is
+    correct. Use ``pearson_loss`` in that regime — see the reach-disk
+    discussion in docs/reachability_and_capacity.md.
     """
     dot = jnp.sum(I * target)
     norm_I = jnp.sqrt(jnp.sum(I**2) + 1e-12)
     norm_T = jnp.sqrt(jnp.sum(target**2) + 1e-12)
+    return 1.0 - dot / (norm_I * norm_T)
+
+
+def pearson_loss(I: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    """
+    1 - pearson_correlation(I, target) = mean-subtracted cosine loss.
+
+    Invariant to *both* brightness scale and brightness offset: only the
+    relative spatial pattern matters. Equivalent to cosine_loss after
+    subtracting the mean from both inputs.
+
+    Use this when the physical contrast ceiling is below what the target
+    image asks for — e.g. shallow throw + small bright spots. Cosine
+    will penalize the unreachable contrast gap; Pearson won't, freeing
+    the optimizer's slope budget for shape-matching in reach-disk regions.
+    """
+    I_c = I - jnp.mean(I)
+    T_c = target - jnp.mean(target)
+    dot = jnp.sum(I_c * T_c)
+    norm_I = jnp.sqrt(jnp.sum(I_c**2) + 1e-12)
+    norm_T = jnp.sqrt(jnp.sum(T_c**2) + 1e-12)
     return 1.0 - dot / (norm_I * norm_T)
 
 

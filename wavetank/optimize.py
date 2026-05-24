@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from .physics import Propagator, steady_state_amplitudes, unpack_complex
 from .render import caustic_image, reconstruct_surface, _gaussian_blur_separable
-from .loss import cosine_loss, ssim_loss
+from .loss import cosine_loss, ssim_loss, pearson_loss
 from .hos import hos_forward, HOSConfig
 
 
@@ -95,7 +95,7 @@ def make_loss(
                     making the target persist throughout one period.
     sigma         : rendering blur
     sigma_blur    : target pre-blur (0 = no blur)
-    loss_type     : 'cosine' or 'ssim'
+    loss_type     : 'cosine', 'pearson', or 'ssim'
     lambda_energy : L2 regularization weight on phasor amplitudes
     lambda_eta    : L2 penalty on mean(η²) — keeps the optimizer in the
                     linear-wave regime where |η| ≪ depth. The default
@@ -134,6 +134,9 @@ def make_loss(
 
     # Precompute target norm for cosine loss
     norm_T = float(jnp.sqrt(jnp.sum(T_b**2) + 1e-12))
+    # Precompute mean-subtracted target for pearson loss
+    T_b_centered = T_b - jnp.mean(T_b)
+    norm_T_centered = float(jnp.sqrt(jnp.sum(T_b_centered**2) + 1e-12))
 
     Omega = jnp.asarray(Omega_freqs)
 
@@ -156,6 +159,14 @@ def make_loss(
             dot = jnp.sum(I * T_b)
             norm_I = jnp.sqrt(jnp.sum(I ** 2) + 1e-12)
             return 1.0 - dot / (norm_I * norm_T)
+        elif loss_type == 'pearson':
+            # Mean-subtracted cosine; offset-invariant.
+            # See docs/reachability_and_capacity.md "Geometric contrast bound"
+            # for why this matters in cap-limited physical-regime runs.
+            I_c = I - jnp.mean(I)
+            dot = jnp.sum(I_c * T_b_centered)
+            norm_I = jnp.sqrt(jnp.sum(I_c ** 2) + 1e-12)
+            return 1.0 - dot / (norm_I * norm_T_centered)
         elif loss_type == 'ssim':
             return ssim_loss(I, T_b, dx, dy)
         else:
@@ -243,7 +254,7 @@ def optimize_caustic(
                   regime). See make_loss for details.
     lambda_slope: L2 penalty on mean(|∇η|²) to keep paraxial refraction
                   valid (|∇η| ≪ 1). See make_loss for details.
-    loss_type   : 'cosine' or 'ssim'
+    loss_type   : 'cosine', 'pearson', or 'ssim'
     n_water     : refractive index of water
     full_snell  : if True, use the full vector Snell's law renderer instead
                   of the paraxial approximation. Slower (the backward pass
