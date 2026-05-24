@@ -10,4 +10,15 @@ build/
 *.png
 *.jpg
 gifs/
-targets/
+
+# Generated data and model checkpoints — too large for git
+data/
+*.npz
+*.eqx
+
+# Single very large notebook that triggered the 100MB push limit
+example.ipynb
+
+# Allow target images (needed for inverse-problem eval scripts)
+!targets/*.jpg
+!targets/*.png
