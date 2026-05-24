@@ -24,6 +24,7 @@ Run:
     python notebooks/deep_pool_max_apparatus.py
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -59,10 +60,11 @@ SIGMA_RENDER   = 0.005
 N_TEMPORAL     = 5
 SIGMA_TEMPORAL = 0.033
 
-# Cap enforcement (NOT in example.ipynb)
-LAMBDA_ETA     = 100.0
-LAMBDA_SLOPE   = 100.0
-LAMBDA_ENERGY  = 1e-6        # matches deep_pool_examples.py
+# Cap enforcement defaults. Override via --lambda_eta / --lambda_slope CLI args
+# to sweep the linearity-cap stringency. example.ipynb uses 0 for both.
+DEFAULT_LAMBDA_ETA   = 100.0
+DEFAULT_LAMBDA_SLOPE = 100.0
+LAMBDA_ENERGY        = 1e-6        # matches deep_pool_examples.py
 
 # Optimization — L-BFGS, full Snell, matching the deep_pool baseline
 LR             = 1e-3        # ignored by L-BFGS but optimize_caustic API wants it
@@ -73,9 +75,9 @@ STAGES = (
 )
 FULL_SNELL = True            # matches deep_pool_examples.py
 
-TARGETS_DIR = Path("targets")
-OUT_DIR     = Path("data/deep_pool_max")
-TARGETS = ["dog_square.jpg", "head.jpg", "ANNA.jpg", "HELLO.jpg"]
+TARGETS_DIR    = Path("targets")
+BASE_OUT_DIR   = Path("data/deep_pool_max")
+TARGETS        = ["dog_square.jpg", "head.jpg", "ANNA.jpg", "HELLO.jpg"]
 
 
 def build_setup():
@@ -105,8 +107,12 @@ def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
-def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(lambda_eta: float, lambda_slope: float):
+    # Output directory tagged by cap stringency so sweep runs don't overwrite
+    tag = f"eta{lambda_eta:g}_slope{lambda_slope:g}"
+    out_dir = BASE_OUT_DIR / tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"JAX {jax.__version__} on {jax.default_backend()}\n", flush=True)
 
     prop, Omega = build_setup()
@@ -115,9 +121,10 @@ def main():
     print(f"Apparatus: depth={DEPTH}m, actuators={n_act} ({N_ACT_PER_SIDE}/side), "
           f"freqs={n_freq} [{FREQ_MIN_HZ}-{FREQ_MAX_HZ}Hz]")
     print(f"           modes={N_MODES}², grid={NX}×{NY}, phasor DOFs={n_params}")
-    print(f"Regularizers: λ_eta={LAMBDA_ETA}, λ_slope={LAMBDA_SLOPE} (linear regime enforced)")
-    print(f"Optimizer: Adam lr={LR}, {sum(s.iters for s in STAGES)} total iters across "
-          f"{len(STAGES)} stages, temporal window n={N_TEMPORAL}\n", flush=True)
+    print(f"Regularizers: λ_eta={lambda_eta}, λ_slope={lambda_slope}")
+    print(f"Optimizer: L-BFGS, {sum(s.iters for s in STAGES)} total iters across "
+          f"{len(STAGES)} stages, temporal window n={N_TEMPORAL}")
+    print(f"Output: {out_dir}\n", flush=True)
 
     xs = np.linspace(0, LX, NX)
     ys = np.linspace(0, LY, NY)
@@ -168,8 +175,8 @@ def main():
             prop, target_bl, np.asarray(Omega), T_array,
             stages=STAGES,
             lr=LR,
-            lambda_eta=LAMBDA_ETA,
-            lambda_slope=LAMBDA_SLOPE,
+            lambda_eta=lambda_eta,
+            lambda_slope=lambda_slope,
             lambda_energy=LAMBDA_ENERGY,
             loss_type='cosine',
             full_snell=FULL_SNELL,
@@ -201,19 +208,25 @@ def main():
             ax.axis("off")
 
     fig.tight_layout()
-    out_png = OUT_DIR / "comparison.png"
+    out_png = out_dir / "comparison.png"
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
     print(f"\nSaved {out_png}")
 
-    with open(OUT_DIR / "results.json", "w") as f:
+    with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved {OUT_DIR / 'results.json'}")
+    print(f"Saved {out_dir / 'results.json'}")
 
-    print(f"\n{'='*60}\n  Summary\n{'='*60}")
+    print(f"\n{'='*60}\n  Summary (λ_eta={lambda_eta}, λ_slope={lambda_slope})\n{'='*60}")
     print(f"  {'target':<20} {'cos':>8} {'time (s)':>10}")
     for fname, r in results.items():
         print(f"  {fname:<20} {r['cos']:>8.3f} {r['elapsed_s']:>10.1f}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lambda_eta',   type=float, default=DEFAULT_LAMBDA_ETA,
+                        help='L2 penalty on mean(η²) [default: 100]')
+    parser.add_argument('--lambda_slope', type=float, default=DEFAULT_LAMBDA_SLOPE,
+                        help='L2 penalty on mean(|∇η|²) [default: 100]')
+    args = parser.parse_args()
+    main(lambda_eta=args.lambda_eta, lambda_slope=args.lambda_slope)
