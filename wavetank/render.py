@@ -97,7 +97,7 @@ def snell_landing(
     eta: jnp.ndarray,
     deta_dx: jnp.ndarray,
     deta_dy: jnp.ndarray,
-    depth: float,
+    throw: float,
     n_water: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
@@ -106,6 +106,10 @@ def snell_landing(
     Incident ray: d_i = (0, 0, -1) (straight down).
     Surface normal: n̂ = normalize(-∂η/∂x, -∂η/∂y, 1).
     Refracted ray traced from the surface to z=0.
+
+    ``throw`` is the optical projection distance from the mean water
+    surface to the screen (= ``tank.depth`` for a flat-bottom tank, or
+    ``depth + d_air`` for an elevated glass-bottom tank).
 
     Returns x_land, y_land : each [nx, ny]
     """
@@ -124,7 +128,7 @@ def snell_landing(
     dt_y = coeff * ny_s
     dt_z = -ratio + coeff * nz_s
 
-    t_hit = -(depth - eta) / dt_z
+    t_hit = -(throw - eta) / dt_z
     return X_src + dt_x * t_hit, Y_src + dt_y * t_hit
 
 
@@ -134,17 +138,20 @@ def _paraxial_landing(
     eta: jnp.ndarray,
     deta_dx: jnp.ndarray,
     deta_dy: jnp.ndarray,
-    depth: float,
+    throw: float,
     n_water: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Paraxial (small-angle) refraction approximation.
 
-    x_land ≈ x + (depth - η) · (∂η/∂x) / n_water
+    x_land ≈ x + (throw - η) · (∂η/∂x) / n_water
+
+    ``throw`` is the optical projection distance (= tank.throw); see
+    ``snell_landing`` for the physical interpretation.
     """
     ratio = 1.0 / n_water
-    x_land = X_src + (depth - eta) * deta_dx * ratio
-    y_land = Y_src + (depth - eta) * deta_dy * ratio
+    x_land = X_src + (throw - eta) * deta_dx * ratio
+    y_land = Y_src + (throw - eta) * deta_dy * ratio
     return x_land, y_land
 
 
@@ -289,7 +296,7 @@ def _caustic_image_fwd_core(prop, a, n_water, sigma, cutoff_sigmas, full_snell):
     nx, ny = prop.nx, prop.ny
     dx = float(xs[1] - xs[0])
     dy = float(ys[1] - ys[0])
-    depth = prop.tank.depth
+    throw = prop.tank.throw
 
     sigma = sigma if sigma > 0 else 1.5 * max(dx, dy)
     w = int(math.ceil(cutoff_sigmas * sigma / max(dx, dy)))
@@ -303,10 +310,10 @@ def _caustic_image_fwd_core(prop, a, n_water, sigma, cutoff_sigmas, full_snell):
 
     if full_snell:
         x_land, y_land = snell_landing(X_src, Y_src, eta, deta_dx, deta_dy,
-                                        depth, n_water)
+                                        throw, n_water)
     else:
         x_land, y_land = _paraxial_landing(X_src, Y_src, eta, deta_dx, deta_dy,
-                                            depth, n_water)
+                                            throw, n_water)
 
     # ── Phase C: bilinear splatting ───────────────────────────────────
     fi_raw = (x_land - xs[0]) / dx
@@ -330,7 +337,7 @@ def _caustic_image_fwd_core(prop, a, n_water, sigma, cutoff_sigmas, full_snell):
     I = _gaussian_blur_separable(D, dx, dy, sigma, w)
 
     residuals = (eta, deta_dx, deta_dy, ix0, iy0, wx, wy, mask, dx, dy, sigma, w,
-                 depth, n_water)
+                 throw, n_water)
     return xs, ys, I, residuals
 
 
@@ -347,7 +354,7 @@ def _caustic_bwd(prop, n_water, sigma, cutoff_sigmas, full_snell, residuals, g):
     # residuals: saved from fwd; g: cotangent tuple (dL/dxs, dL/dys, dL/dI)
     (eta, deta_dx, deta_dy,
      ix0, iy0, wx, wy, mask,
-     dx, dy, sigma_r, w, depth, n_water_r) = residuals
+     dx, dy, sigma_r, w, throw, n_water_r) = residuals
 
     dL_dI = g[2]   # gradient w.r.t. I (xs, ys are non-differentiable)
 
@@ -366,12 +373,12 @@ def _caustic_bwd(prop, n_water, sigma, cutoff_sigmas, full_snell, residuals, g):
         X_src = jnp.asarray(prop.X_src)
         Y_src = jnp.asarray(prop.Y_src)
         def _snell_fn(eta_, dx_, dy_):
-            return snell_landing(X_src, Y_src, eta_, dx_, dy_, depth, n_water_r)
+            return snell_landing(X_src, Y_src, eta_, dx_, dy_, throw, n_water_r)
         _, vjp_fn = jax.vjp(_snell_fn, eta, deta_dx, deta_dy)
         dL_deta, dL_detax, dL_detay = vjp_fn((dL_dxl, dL_dyl))
     else:
         inv_n = 1.0 / n_water_r
-        scale = (depth - eta) * inv_n
+        scale = (throw - eta) * inv_n
         dL_detax = dL_dxl * scale
         dL_detay = dL_dyl * scale
         dL_deta  = -dL_dxl * deta_dx * inv_n - dL_dyl * deta_dy * inv_n

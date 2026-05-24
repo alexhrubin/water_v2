@@ -168,7 +168,11 @@ def analytical_solve(
       a_desired : target modal amplitudes [n_total]
     """
     Lx, Ly = prop.tank.Lx, prop.tank.Ly
-    depth = prop.tank.depth
+    # The Poisson inversion derives from the *paraxial* caustic model
+    # `I ≈ 1 - (throw/n_water)·∇²η`, which depends on optical throw, not
+    # water depth. With a flat-bottom tank these are equal; with an
+    # elevated glass-bottom + air gap they differ.
+    throw = prop.tank.throw
     damping = prop.tank.damping
     n_modes = prop.n_modes
     n_total = len(prop.omega)
@@ -198,7 +202,7 @@ def analytical_solve(
     for j in range(n_total):
         m, n = prop.mode_m[j], prop.mode_n[j]
         k2 = (m * np.pi / Lx)**2 + (n * np.pi / Ly)**2
-        a_desired[j] = coeffs[m, n] * n_water / (depth * k2)
+        a_desired[j] = coeffs[m, n] * n_water / (throw * k2)
 
     # ── 3. Mask modes with negligible actuator coupling ───────────────
     max_coupling = np.abs(prop.C).max(axis=1)          # [n_total]
@@ -218,7 +222,7 @@ def analytical_solve(
         a_2d[m, n] = a_desired[j]
 
     lap_field = prop.cos_x @ (-k2_2d * a_2d) @ prop.cos_y.T   # ∇²η  [nx, ny]
-    caustic_dev = (depth / n_water) * lap_field
+    caustic_dev = (throw / n_water) * lap_field
     caustic_range = float(np.abs(caustic_dev).max())
 
     if caustic_range > max_contrast:
@@ -240,15 +244,24 @@ def analytical_solve(
     E = np.exp(1j * Omega_freqs * T_eval)              # [n_freq]
     beta = H * E[None, :]                               # [n_total, n_freq]
 
-    # Build M in vectorized form:
-    # M_X[:, k*n_act:(k+1)*n_act] = C * imag(β[:,k])   (broadcast over actuators)
-    # M_Y[:, k*n_act:(k+1)*n_act] = C * real(β[:,k])
+    # Build M with actuator-major column ordering to match unpack_complex:
+    #   θ[i*n_freq + k]           = X[i,k]  (X block, first n_act*n_freq cols)
+    #   θ[n_act*n_freq + i*n_freq + k] = Y[i,k]  (Y block, last n_act*n_freq cols)
+    #
+    # M[j, i*n_freq + k] = C[j,i] * Im(β[j,k])   (X columns)
+    # M[j, n_act*n_freq + i*n_freq + k] = C[j,i] * Re(β[j,k])   (Y columns)
+    #
+    # Vectorised: C[:,i,None] * Im(β)[:,None,:] → [n_total, n_act, n_freq]
+    # then reshape to [n_total, n_act*n_freq] (row-major = actuator-major).
+    imag_beta = np.imag(beta)   # [n_total, n_freq]
+    real_beta = np.real(beta)   # [n_total, n_freq]
     M = np.zeros((n_total, 2 * n_act * n_freq))
-    for k in range(n_freq):
-        M[:, k * n_act:(k + 1) * n_act] = (
-            prop.C * np.imag(beta[:, k:k + 1]))
-        M[:, n_act * n_freq + k * n_act:n_act * n_freq + (k + 1) * n_act] = (
-            prop.C * np.real(beta[:, k:k + 1]))
+    M[:, :n_act * n_freq] = (
+        prop.C[:, :, None] * imag_beta[:, None, :]
+    ).reshape(n_total, n_act * n_freq)
+    M[:, n_act * n_freq:] = (
+        prop.C[:, :, None] * real_beta[:, None, :]
+    ).reshape(n_total, n_act * n_freq)
     M *= achievable[:, None]   # zero out rows for unachievable modes
 
     # Regularized least-squares (min-norm if underdetermined)
@@ -269,7 +282,7 @@ def setup_from_target(
     energy_fraction: float = 0.95,
     nx: int = 100,
     ny: int = 100,
-    n_modes_max: int = 50,
+    n_modes_max: int = 60,
     actuator_width: float = 0.05,
     T_eval: float = 1.0,
     n_water: float = 1.33,
@@ -277,6 +290,12 @@ def setup_from_target(
     """
     Automatically configure a propagator and compute an analytical warm-start
     from a target image.
+
+    For sharp targets (small bright spots, high-contrast edges), increase
+    `energy_fraction` toward 0.99 and `n_modes_max` toward 80. Sharp features
+    require short-wavelength modes; if the analyzer caps out at the suggested
+    n_modes_max, the optimizer will compensate with large amplitudes that
+    may break the linear-wave assumptions.
 
     Returns a dict with keys:
       prop, Omega_freqs, target_bl, analysis, freqs, actuators, p0

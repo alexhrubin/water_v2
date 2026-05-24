@@ -29,12 +29,40 @@ import jax.numpy as jnp
 
 @dataclass(frozen=True)
 class Tank:
-    """Rectangular wave tank geometry and physical parameters."""
+    """
+    Rectangular wave tank geometry and physical parameters.
+
+    Two physically distinct length scales live here:
+
+    - ``depth`` is the water column height. It controls the dispersion
+      relation ``ω² = g·k·tanh(k·depth)`` and the linearity bound
+      ``|η|/depth < 0.1``. Pick it for the wave-physics regime you
+      want (a small value keeps the optimizer comfortably in the
+      linear regime).
+
+    - ``projection_distance`` is the optical throw between the wavy
+      water surface and the screen the caustic lands on. With an
+      elevated glass-bottom tank it equals ``depth + d_air``; with the
+      light landing directly on the tank floor it equals ``depth``. It
+      enters the paraxial / Snell renderer and the analytical Poisson
+      inversion (which both depend only on the optical throw, not the
+      water column).
+
+    If ``projection_distance`` is left as ``None`` the throw falls back
+    to ``depth``, preserving the single-knob behaviour the rest of the
+    codebase had before this field existed.
+    """
     Lx: float           # length in x (m)
     Ly: float           # length in y (m)
     depth: float        # water depth (m)
     damping: float = 0.02   # modal damping ratio γ
     g: float = 9.81     # gravitational acceleration (m/s²)
+    projection_distance: float | None = None  # optical throw (m); None → depth
+
+    @property
+    def throw(self) -> float:
+        """Optical throw distance: ``projection_distance`` or ``depth``."""
+        return self.projection_distance if self.projection_distance is not None else self.depth
 
 
 @dataclass(frozen=True)

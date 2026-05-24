@@ -38,11 +38,22 @@ from .optimize import (
     Stage,
     make_loss,
     optimize_caustic,
+    surface_validity_report,
+    make_hos_forward,
 )
 from .analytical import (
     analyze_target,
     analytical_solve,
     setup_from_target,
+)
+from .feasibility import (
+    feasibility_report,
+    print_feasibility_report,
+)
+from .surface_solver import (
+    solve_target_surface,
+    solve_target_surface_mesh,
+    project_to_modes,
 )
 from .nonideal import (
     NonIdealHyperparams,
@@ -62,6 +73,16 @@ from .correction import (
     save_model,
     load_model,
 )
+from .hos import (
+    HOSConfig,
+    hos_forward,
+    steady_state_initial,
+)
+from .inverse_render import (
+    caustic_from_eta,
+    optimize_eta_for_target,
+    optimize_modal_eta_for_target,
+)
 
 __all__ = [
     "Tank", "Actuator", "Propagator", "build_propagator",
@@ -69,8 +90,11 @@ __all__ = [
     "pack_complex", "unpack_complex",
     "reconstruct_surface", "caustic_image", "snell_landing",
     "cosine_loss", "ssim_loss", "load_target_image",
-    "Stage", "make_loss", "optimize_caustic",
+    "Stage", "make_loss", "optimize_caustic", "surface_validity_report",
+    "make_hos_forward",
     "analyze_target", "analytical_solve", "setup_from_target",
+    "feasibility_report", "print_feasibility_report",
+    "solve_target_surface", "solve_target_surface_mesh", "project_to_modes",
     "NonIdealHyperparams", "NonIdealConfig",
     "sample_nonideal_config", "make_nonideal_propagator",
     "caustic_image_nonideal",
@@ -78,4 +102,7 @@ __all__ = [
     "CorrectionUNet", "apply_correction",
     "generate_training_data", "train_correction",
     "make_corrected_loss", "save_model", "load_model",
+    "HOSConfig", "hos_forward", "steady_state_initial",
+    "caustic_from_eta", "optimize_eta_for_target",
+    "optimize_modal_eta_for_target",
 ]

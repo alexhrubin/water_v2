@@ -12,7 +12,7 @@ custom VJP.
 """
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -20,8 +20,33 @@ import optax
 from tqdm import tqdm
 
 from .physics import Propagator, steady_state_amplitudes, unpack_complex
-from .render import caustic_image, _gaussian_blur_separable
+from .render import caustic_image, reconstruct_surface, _gaussian_blur_separable
 from .loss import cosine_loss, ssim_loss
+from .hos import hos_forward, HOSConfig
+
+
+def make_hos_forward(
+    M: int = 2,
+    dealias_max_modes: int | None = None,
+    steps_per_period: int = 40,
+    initial: str = "steady",
+) -> Callable:
+    """
+    Build a steady-state-IC HOS forward closure matching the signature of
+    ``steady_state_amplitudes``, suitable for passing as ``forward_fn`` to
+    ``optimize_caustic`` / ``make_loss``.
+
+    Parameters mirror ``HOSConfig``. ``initial="steady"`` is the default and
+    skips the cold-start transient — appropriate for steady-state-style
+    optimization at a chosen T_eval.
+    """
+    cfg = HOSConfig(M=M, dealias_max_modes=dealias_max_modes,
+                    steps_per_period=steps_per_period)
+
+    def forward(prop, P, Omega, T):
+        return hos_forward(prop, P, Omega, T_eval=T, config=cfg, initial=initial)
+
+    return forward
 
 
 # ── Stage specification ────────────────────────────────────────────────
@@ -47,8 +72,11 @@ def make_loss(
     sigma_blur: float = 0.02,
     loss_type: str = 'cosine',
     lambda_energy: float = 1e-5,
+    lambda_eta: float = 100.0,
+    lambda_slope: float = 100.0,
     n_water: float = 1.33,
     full_snell: bool = False,
+    forward_fn: Callable | None = None,
 ) -> callable:
     """
     Build a scalar loss function over the parameter vector params.
@@ -69,8 +97,26 @@ def make_loss(
     sigma_blur    : target pre-blur (0 = no blur)
     loss_type     : 'cosine' or 'ssim'
     lambda_energy : L2 regularization weight on phasor amplitudes
+    lambda_eta    : L2 penalty on mean(η²) — keeps the optimizer in the
+                    linear-wave regime where |η| ≪ depth. The default
+                    100.0 contributes ≈ 0.014 at η_rms = 12 mm (well below
+                    the loss-match term) but ≈ 49 at η_rms = 700 mm
+                    (dominant), preventing the scale-invariant cosine loss
+                    from running away to unphysical surface heights.
+    lambda_slope  : L2 penalty on mean(|∇η|²) — enforces the paraxial
+                    refraction assumption |∇η| ≪ 1. With the default
+                    100.0 the penalty is ≈ 1.0 at RMS slope 0.1 (the
+                    linearity boundary), comparable to a typical match
+                    loss. Uses ∂η/∂x, ∂η/∂y from reconstruct_surface —
+                    essentially free since they're already computed.
     n_water       : refractive index
     full_snell    : use full Snell's law refraction
+    forward_fn    : function with signature (prop, P, Omega, T) → a that
+                    produces modal amplitudes from drive at time T. Defaults
+                    to ``steady_state_amplitudes`` (linear theory). Pass an
+                    HOS-based forward (e.g., from ``make_hos_forward``) to
+                    optimize through nonlinear waves. HOS forwards do NOT
+                    support movie-mode T_eval (sequence).
     """
     n_act = prop.n_act
     n_freq = len(Omega_freqs)
@@ -91,9 +137,16 @@ def make_loss(
 
     Omega = jnp.asarray(Omega_freqs)
 
+    fwd = forward_fn if forward_fn is not None else steady_state_amplitudes
+
     # Movie mode: T_eval is an array → average loss over multiple frames.
     movie_mode = not np.isscalar(T_eval)
     if movie_mode:
+        if forward_fn is not None:
+            raise ValueError(
+                "forward_fn (e.g., HOS) does not support movie-mode T_eval. "
+                "Pass a scalar T_eval, or use the default linear forward."
+            )
         T_array = jnp.asarray(T_eval)
     else:
         T_scalar = float(T_eval)
@@ -114,21 +167,33 @@ def make_loss(
 
         if movie_mode:
             def per_frame(t):
-                a = steady_state_amplitudes(prop, P, Omega, t)
+                a = fwd(prop, P, Omega, t)
                 _, _, I = caustic_image(prop, a,
                                         n_water=n_water, sigma=sigma,
                                         full_snell=full_snell)
-                return _frame_loss(I)
-            L_match = jnp.mean(jax.vmap(per_frame)(T_array))
+                eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
+                return (_frame_loss(I),
+                        jnp.mean(eta ** 2),
+                        jnp.mean(deta_dx ** 2 + deta_dy ** 2))
+            losses, eta_sq_means, slope_sq_means = jax.vmap(per_frame)(T_array)
+            L_match = jnp.mean(losses)
+            L_eta = jnp.mean(eta_sq_means)
+            L_slope = jnp.mean(slope_sq_means)
         else:
-            a = steady_state_amplitudes(prop, P, Omega, T_scalar)
+            a = fwd(prop, P, Omega, T_scalar)
             _, _, I = caustic_image(prop, a,
                                     n_water=n_water, sigma=sigma,
                                     full_snell=full_snell)
+            eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
             L_match = _frame_loss(I)
+            L_eta = jnp.mean(eta ** 2)
+            L_slope = jnp.mean(deta_dx ** 2 + deta_dy ** 2)
 
         L_energy = jnp.sum(X**2) + jnp.sum(Y**2)
-        return L_match + lambda_energy * L_energy
+        return (L_match
+                + lambda_energy * L_energy
+                + lambda_eta * L_eta
+                + lambda_slope * L_slope)
 
     return loss_fn
 
@@ -148,9 +213,14 @@ def optimize_caustic(
     ),
     lr: float = 0.001,
     lambda_energy: float = 1e-5,
+    lambda_eta: float = 100.0,
+    lambda_slope: float = 100.0,
     loss_type: str = 'cosine',
     n_water: float = 1.33,
+    full_snell: bool = False,
     p0: np.ndarray | None = None,
+    check_validity: bool = True,
+    forward_fn: Callable | None = None,
 ) -> tuple[np.ndarray, list[float]]:
     """
     Optimize actuator phasors to reproduce a target caustic pattern.
@@ -169,9 +239,21 @@ def optimize_caustic(
     stages      : sequence of Stage(sigma, sigma_blur, iters)
     lr          : Adam learning rate
     lambda_energy: L2 regularization on phasor amplitudes
+    lambda_eta  : L2 penalty on mean(η²) to keep |η| ≪ depth (linear-wave
+                  regime). See make_loss for details.
+    lambda_slope: L2 penalty on mean(|∇η|²) to keep paraxial refraction
+                  valid (|∇η| ≪ 1). See make_loss for details.
     loss_type   : 'cosine' or 'ssim'
     n_water     : refractive index of water
+    full_snell  : if True, use the full vector Snell's law renderer instead
+                  of the paraxial approximation. Slower (the backward pass
+                  falls back to jax.vjp through snell_landing instead of
+                  the analytical paraxial adjoint), but correct at any
+                  surface slope. Use when the slope penalty alone is not
+                  enough to satisfy max|∇η| < 0.1.
     p0          : initial parameter vector; if None, initialized to zeros
+    check_validity : if True, after the final stage print a warning when
+                  max|η|/depth or max|∇η| exceed 0.1 (linear-wave limit).
 
     Returns
     -------
@@ -195,7 +277,9 @@ def optimize_caustic(
             prop, target, Omega_freqs, T_eval,
             sigma=stage.sigma, sigma_blur=stage.sigma_blur,
             loss_type=loss_type, lambda_energy=lambda_energy,
-            n_water=n_water,
+            lambda_eta=lambda_eta, lambda_slope=lambda_slope,
+            n_water=n_water, full_snell=full_snell,
+            forward_fn=forward_fn,
         )
 
         desc = f"σ={stage.sigma:.3f} [{stage.method}]"
@@ -219,7 +303,90 @@ def optimize_caustic(
                     loss_history.append(L_val)
                     pbar.set_postfix(loss=f"{L_val:.4f}")
 
+    if check_validity:
+        report = surface_validity_report(prop, params, Omega_freqs, T_eval)
+        _print_validity_report(report)
+
     return np.asarray(params), loss_history
+
+
+# ── Linear-wave validity check ───────────────────────────────────────
+
+def surface_validity_report(
+    prop: Propagator,
+    params: np.ndarray,
+    Omega_freqs: np.ndarray,
+    T_eval: float | Sequence[float],
+) -> dict:
+    """
+    Diagnose whether an optimized solution stays in the linear-wave regime.
+
+    Linear water-wave theory assumes |η| ≪ depth and |∇η| ≪ 1. When the
+    cosine loss is scale-invariant, the optimizer can drive the surface to
+    arbitrarily large heights while still claiming "small" loss — at which
+    point the linearized propagator and the paraxial refraction model are
+    no longer faithful to reality.
+
+    Returns a dict with the worst-case η/depth ratio and surface slope
+    across all evaluation frames, plus pass/fail flags against the
+    conventional 0.1 thresholds.
+    """
+    n_act = prop.n_act
+    n_freq = len(Omega_freqs)
+    depth = float(prop.tank.depth)
+
+    X, Y = unpack_complex(jnp.asarray(params), n_act, n_freq)
+    P = X + 1j * Y
+    Omega = jnp.asarray(Omega_freqs)
+
+    if np.isscalar(T_eval):
+        T_array = jnp.array([float(T_eval)])
+    else:
+        T_array = jnp.asarray(T_eval, dtype=jnp.float64)
+
+    def _frame_stats(t):
+        a = steady_state_amplitudes(prop, P, Omega, t)
+        eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
+        max_abs_eta = jnp.max(jnp.abs(eta))
+        max_slope = jnp.max(jnp.sqrt(deta_dx ** 2 + deta_dy ** 2))
+        return max_abs_eta, max_slope
+
+    max_etas, max_slopes = jax.vmap(_frame_stats)(T_array)
+    max_abs_eta = float(jnp.max(max_etas))
+    max_slope = float(jnp.max(max_slopes))
+
+    eta_ratio = max_abs_eta / depth
+    return {
+        'max_abs_eta_m': max_abs_eta,
+        'depth_m': depth,
+        'eta_over_depth': eta_ratio,
+        'max_slope': max_slope,
+        'eta_ok': eta_ratio < 0.1,
+        'slope_ok': max_slope < 0.1,
+    }
+
+
+def _print_validity_report(report: dict) -> None:
+    """Pretty-print a validity report; warn loudly if either threshold exceeded."""
+    eta_mm = report['max_abs_eta_m'] * 1000
+    depth_mm = report['depth_m'] * 1000
+    bad = (not report['eta_ok']) or (not report['slope_ok'])
+    if bad:
+        print()
+        print("  " + "!" * 60)
+        print("  WARNING — linear-wave assumptions violated")
+        print(f"    max|η|     = {eta_mm:7.2f} mm   (depth = {depth_mm:.1f} mm)")
+        print(f"    |η|/depth  = {report['eta_over_depth']:7.3f}    "
+              f"({'OK' if report['eta_ok'] else 'FAIL — should be < 0.1'})")
+        print(f"    max|∇η|    = {report['max_slope']:7.3f}    "
+              f"({'OK' if report['slope_ok'] else 'FAIL — should be < 0.1'})")
+        print("  Linear-wave theory and paraxial refraction are unreliable here.")
+        print("  Try: increase lambda_eta, lower target intensity, or use more modes.")
+        print("  " + "!" * 60)
+    else:
+        print(f"  Linear-wave validity: OK  "
+              f"(|η|/depth = {report['eta_over_depth']:.3f}, "
+              f"max|∇η| = {report['max_slope']:.3f})")
 
 
 def _run_lbfgs(

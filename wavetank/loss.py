@@ -52,9 +52,11 @@ def ssim_loss(
     mean_I = jnp.sum(I) / n + 1e-12
     I_n = I * (mean_T / mean_I)
 
-    # SSIM stability constants (Wang et al. 2004)
-    L = float(jnp.max(target))
-    C1, C2 = (0.01 * L)**2, (0.03 * L)**2
+    # SSIM stability constants (Wang et al. 2004).  Keep as jnp scalars
+    # so the function is jit-safe (float() on a traced array would error).
+    L = jnp.max(target)
+    C1 = (0.01 * L) ** 2
+    C2 = (0.03 * L) ** 2
 
     import math
     w = int(math.ceil(4.0 * sigma_w / max(dx, dy)))
