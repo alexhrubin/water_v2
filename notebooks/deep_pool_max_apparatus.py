@@ -38,6 +38,7 @@ from wavetank import (
     steady_state_amplitudes, caustic_image, unpack_complex,
     load_target_image,
     Stage, optimize_caustic,
+    analytical_solve,
 )
 
 # ── Apparatus (matched to example.ipynb except for depth) ────────────
@@ -129,6 +130,12 @@ def main():
         target = target[::-1].T
         target = target / max(target.max(), 1e-9)
 
+        # Analytical warm-start (matches what setup_from_target does internally)
+        ana = analytical_solve(prop, target.astype(np.float32),
+                               np.asarray(Omega), T_EVAL)
+        p0 = ana['p0']
+        print(f"  analytical warm-start ‖p0‖ = {np.linalg.norm(p0):.4e}", flush=True)
+
         t0 = time.perf_counter()
         params, history = optimize_caustic(
             prop, target.astype(np.float32), np.asarray(Omega), T_array,
@@ -138,6 +145,7 @@ def main():
             lambda_slope=LAMBDA_SLOPE,
             lambda_energy=LAMBDA_ENERGY,
             loss_type='cosine',
+            p0=p0,
             check_validity=True,
         )
         elapsed = time.perf_counter() - t0
