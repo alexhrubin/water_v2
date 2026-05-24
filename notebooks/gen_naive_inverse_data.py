@@ -40,7 +40,7 @@ PHASOR_SCALE_MAX = 5e-4         # near linearity cap / sharp caustics
 ETA_CAP        = 0.10           # post-select: |η|/depth threshold
 SLOPE_CAP      = 0.10           # post-select: |∇η|     threshold
 
-N_SAMPLES   = 1_000_000
+N_SAMPLES   = 500_000      # Colab T4 has ~12 GB RAM; 1M overruns the host buffer
 BATCH_SIZE  = 1024
 SEED        = 0
 OUT_DIR     = Path("data/naive_inverse")
