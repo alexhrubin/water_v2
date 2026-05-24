@@ -38,7 +38,7 @@ from wavetank import (
     steady_state_amplitudes, caustic_image, unpack_complex,
     load_target_image,
     Stage, optimize_caustic,
-    analytical_solve,
+    analytical_solve, analyze_target,
 )
 
 # ── Apparatus (matched to example.ipynb except for depth) ────────────
@@ -122,7 +122,7 @@ def main():
     T_array = temporal_window()
 
     results = {}
-    fig, axes = plt.subplots(len(TARGETS), 2, figsize=(8, 4 * len(TARGETS)))
+    fig, axes = plt.subplots(len(TARGETS), 3, figsize=(12, 4 * len(TARGETS)))
 
     for i, fname in enumerate(TARGETS):
         print(f"\n{'='*60}\n  Target: {fname}\n{'='*60}", flush=True)
@@ -130,15 +130,40 @@ def main():
         target = target[::-1].T
         target = target / max(target.max(), 1e-9)
 
-        # Analytical warm-start (matches what setup_from_target does internally)
-        ana = analytical_solve(prop, target.astype(np.float32),
-                               np.asarray(Omega), T_EVAL)
+        # ── Band-limit target to the modes the apparatus can represent ──
+        # The raw target has high-frequency content the cosine basis with
+        # n_modes can't reproduce. Optimizing against the raw target asks
+        # the optimizer to satisfy something physically impossible →
+        # diverges into bad regions. Project onto the apparatus's mode
+        # subspace first; optimize against the achievable shadow.
+        # (This is exactly what setup_from_target does internally.)
+        Tank_for_analysis = Tank(Lx=LX, Ly=LY, depth=DEPTH, damping=DAMPING)
+        analysis = analyze_target(target.astype(np.float32), Tank_for_analysis,
+                                  n_modes_max=N_MODES, energy_fraction=0.95)
+        c = analysis['coeffs'][:N_MODES, :N_MODES]
+        target_bl = np.asarray(prop.cos_x) @ c @ np.asarray(prop.cos_y).T
+        target_bl = np.clip(target_bl, 0.0, None)
+        if target_bl.max() > 0:
+            target_bl /= target_bl.max()
+        target_bl = target_bl.astype(np.float32)
+
+        # Analytical warm-start against the band-limited target
+        ana = analytical_solve(prop, target_bl, np.asarray(Omega), T_EVAL)
         p0 = ana['p0']
-        print(f"  analytical warm-start ‖p0‖ = {np.linalg.norm(p0):.4e}", flush=True)
+
+        # Diagnostic: warm-start caustic vs band-limited target
+        X, Y = unpack_complex(jnp.asarray(p0), n_act, n_freq)
+        P = X + 1j * Y
+        a_ws = steady_state_amplitudes(prop, P, Omega, T_EVAL)
+        _, _, I_ws = caustic_image(prop, a_ws, sigma=SIGMA_RENDER)
+        I_ws = np.asarray(I_ws)
+        ws_cos = cosine_sim(target_bl, I_ws / max(I_ws.max(), 1e-9))
+        print(f"  analytical warm-start ‖p0‖ = {np.linalg.norm(p0):.4e}  "
+              f"cos(target_bl, ws_render) = {ws_cos:.3f}", flush=True)
 
         t0 = time.perf_counter()
         params, history = optimize_caustic(
-            prop, target.astype(np.float32), np.asarray(Omega), T_array,
+            prop, target_bl, np.asarray(Omega), T_array,
             stages=STAGES,
             lr=LR,
             lambda_eta=LAMBDA_ETA,
@@ -158,7 +183,7 @@ def main():
         I_final = np.asarray(I_final)
         I_show = I_final / max(I_final.max(), 1e-9)
 
-        cs = cosine_sim(target, I_show)
+        cs = cosine_sim(target_bl, I_show)
         print(f"  elapsed: {elapsed:.1f}s   final loss: {history[-1]:.4e}   "
               f"cos(target, render): {cs:.3f}", flush=True)
         results[fname] = {
@@ -166,10 +191,9 @@ def main():
             "final_loss": float(history[-1]),
         }
 
-        axes[i, 0].imshow(target, cmap="inferno")
-        axes[i, 0].set_title(f"target: {fname}")
-        axes[i, 1].imshow(I_show, cmap="inferno")
-        axes[i, 1].set_title(f"optimized   cos={cs:.3f}")
+        axes[i, 0].imshow(target,     cmap="inferno"); axes[i, 0].set_title(f"target: {fname}")
+        axes[i, 1].imshow(target_bl,  cmap="inferno"); axes[i, 1].set_title("band-limited target (what optimizer matches)")
+        axes[i, 2].imshow(I_show,     cmap="inferno"); axes[i, 2].set_title(f"optimized caustic   cos(target_bl)={cs:.3f}")
         for ax in axes[i]:
             ax.axis("off")
 
