@@ -188,7 +188,14 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
-    T_array = temporal_window(cfg.t_eval, cfg.n_temporal, cfg.sigma_temporal)
+    # HOS forward only supports scalar T_eval (no multi-frame averaging).
+    # Fall back to single-frame when HOS is on.
+    if hos_M is not None and cfg.n_temporal > 1:
+        T_array = cfg.t_eval
+        print(f"  HOS mode: dropping temporal window (n={cfg.n_temporal}), "
+              f"using scalar T_eval={cfg.t_eval}", flush=True)
+    else:
+        T_array = temporal_window(cfg.t_eval, cfg.n_temporal, cfg.sigma_temporal)
 
     # Warm-start
     ana = analytical_solve(prop, target, np.asarray(Omega), cfg.t_eval)
