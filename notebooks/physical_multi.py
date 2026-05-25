@@ -26,7 +26,8 @@ import matplotlib.pyplot as plt
 
 from wavetank import (
     Tank, Actuator, build_propagator,
-    steady_state_amplitudes, caustic_image, unpack_complex,
+    steady_state_amplitudes, caustic_image, reconstruct_surface,
+    unpack_complex,
     load_target_image,
     Stage, optimize_caustic, make_hos_forward,
     analytical_solve,
@@ -260,7 +261,25 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     I_final = np.asarray(I_final)
     I_show = I_final / max(I_final.max(), 1e-9)
     cs = cosine_sim(target, I_show)
+
+    # Always report peak surface stats so we know what regime we ended in.
+    # (When check_validity is False — e.g. under HOS — optimize_caustic
+    # doesn't print this, but we still want to see it.)
+    eta_grid, eta_x, eta_y = reconstruct_surface(prop, a)
+    peak_eta = float(jnp.abs(eta_grid).max())
+    peak_slope = float(jnp.sqrt(eta_x**2 + eta_y**2).max())
+    eta_over_d = peak_eta / depth
+    # Validity regime markers
+    eta_status = "OK" if eta_over_d < 0.1 else "PAST LINEAR"
+    if hos_M is not None:
+        slope_status = ("OK (HOS M=2 valid)" if peak_slope < 0.30
+                        else "PAST HOS M=2" if peak_slope < 0.45
+                        else "PAST WAVE BREAKING")
+    else:
+        slope_status = "OK" if peak_slope < 0.10 else "PAST LINEAR"
     print(f"  elapsed: {elapsed:.1f}s   final cos: {cs:.3f}", flush=True)
+    print(f"  peak |η|/depth = {eta_over_d:.3f}  [{eta_status}]    "
+          f"peak |∇η| = {peak_slope:.3f}  [{slope_status}]", flush=True)
 
     return target, I_show, ws_cos, cs, elapsed
 
