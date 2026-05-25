@@ -142,6 +142,14 @@ TARGETS = [
         stages=STAGES_IMAGE,
         n_temporal=5, sigma_temporal=0.033,
     ),
+    TargetConfig(
+        name="dog",
+        make=make_image_loader("dog_square.jpg"),
+        depth=6.0,                              # broad continuous tone (rule says ~6m)
+        t_eval=1.0,
+        stages=STAGES_IMAGE,
+        n_temporal=5, sigma_temporal=0.033,
+    ),
 ]
 
 
