@@ -28,7 +28,7 @@ from wavetank import (
     Tank, Actuator, build_propagator,
     steady_state_amplitudes, caustic_image, unpack_complex,
     load_target_image,
-    Stage, optimize_caustic,
+    Stage, optimize_caustic, make_hos_forward,
     analytical_solve,
 )
 
@@ -174,12 +174,15 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 
 def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
-            n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
+            n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
+            hos_M=None, iters_scale=1.0):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
+    forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
     print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², "
           f"act={n_act_per_side}/side, freq=[{FREQ_MIN_HZ}-{freq_max}Hz]×{n_freq}, "
-          f"loss={loss_type}, caps={caps_str})\n{'='*60}", flush=True)
+          f"loss={loss_type}, caps={caps_str}, forward={forward_label})\n{'='*60}",
+          flush=True)
     prop, Omega = build_setup(depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
                               freq_max=freq_max, n_freq=n_freq)
     n_act, n_freq = prop.n_act, len(Omega)
@@ -198,10 +201,32 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     ws_cos = cosine_sim(target, I_ws)
     print(f"  warm-start cos = {ws_cos:.3f}  (throw budget ≈ {25*depth:.0f}mm)", flush=True)
 
+    # Optionally scale iters down for the HOS plumbing test (~50x slower per iter)
+    stages_used = cfg.stages
+    if iters_scale != 1.0:
+        stages_used = tuple(
+            Stage(sigma=s.sigma, sigma_blur=s.sigma_blur,
+                  iters=max(1, int(s.iters * iters_scale)), method=s.method)
+            for s in cfg.stages
+        )
+        total_iters = sum(s.iters for s in stages_used)
+        print(f"  iters scaled by {iters_scale}: {total_iters} total", flush=True)
+
+    # Build HOS forward if requested. Disable linear-regime validity check
+    # (its 0.1 threshold is misleading for HOS — M=2 is valid up to ~0.3).
+    forward_fn = None
+    check_validity = True
+    if hos_M is not None:
+        forward_fn = make_hos_forward(M=hos_M, dealias_max_modes=n_modes,
+                                       steps_per_period=20, initial='steady')
+        check_validity = False
+        print(f"  using HOS M={hos_M} forward (initial='steady', "
+              f"steps_per_period=20)", flush=True)
+
     t0 = time.perf_counter()
     params, history = optimize_caustic(
         prop, target, np.asarray(Omega), T_array,
-        stages=cfg.stages,
+        stages=stages_used,
         lr=LR,
         lambda_eta=lambda_caps,
         lambda_slope=lambda_caps,
@@ -209,13 +234,21 @@ def run_one(cfg, xs, ys, loss_type='cosine',
         loss_type=loss_type,
         full_snell=FULL_SNELL,
         p0=p0,
-        check_validity=True,
+        check_validity=check_validity,
+        forward_fn=forward_fn,
     )
     elapsed = time.perf_counter() - t0
 
     X, Y = unpack_complex(jnp.asarray(params), n_act, n_freq)
     P = X + 1j * Y
-    a = steady_state_amplitudes(prop, P, Omega, cfg.t_eval)
+    # Render the final result with the SAME forward we optimized against,
+    # so what we plot is what the optimizer was actually scoring.
+    if hos_M is not None:
+        a = make_hos_forward(M=hos_M, dealias_max_modes=n_modes,
+                              steps_per_period=20, initial='steady')(
+            prop, P, Omega, cfg.t_eval)
+    else:
+        a = steady_state_amplitudes(prop, P, Omega, cfg.t_eval)
     _, _, I_final = caustic_image(prop, a, sigma=SIGMA_RENDER, full_snell=FULL_SNELL)
     I_final = np.asarray(I_final)
     I_show = I_final / max(I_final.max(), 1e-9)
@@ -227,7 +260,8 @@ def run_one(cfg, xs, ys, loss_type='cosine',
 
 def main(loss_type='cosine', depth_override=None, no_caps=False,
          n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
-         freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
+         freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
+         hos_M=None, iters_scale=1.0, targets_filter=None):
     lambda_caps = 0.0 if no_caps else LAMBDA_ETA
     caps_tag = "nocaps" if no_caps else f"caps{LAMBDA_ETA:g}"
     depth_tag = f"d{depth_override}" if depth_override is not None else "dauto"
@@ -238,6 +272,10 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"a{n_act_per_side}")
     if freq_max != FREQ_MAX_HZ or n_freq != N_FREQ:
         parts.append(f"f{freq_max:g}x{n_freq}")
+    if hos_M is not None:
+        parts.append(f"hosM{hos_M}")
+    if iters_scale != 1.0:
+        parts.append(f"its{iters_scale:g}")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -257,19 +295,27 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
     xs = np.linspace(0, LX, NX)
     ys = np.linspace(0, LY, NY)
 
-    n = len(TARGETS)
+    targets_to_run = TARGETS
+    if targets_filter is not None:
+        targets_to_run = [t for t in TARGETS if t.name in targets_filter]
+        if not targets_to_run:
+            raise ValueError(f"No targets matched filter {targets_filter}; "
+                             f"available: {[t.name for t in TARGETS]}")
+
+    n = len(targets_to_run)
     # 3 columns: target | optimized (honest scale) | optimized (contrast-stretched)
     fig, axes = plt.subplots(n, 3, figsize=(13.5, 4.5 * n))
     if n == 1:
         axes = axes[None, :]
 
     summary = []
-    for i, cfg in enumerate(TARGETS):
+    for i, cfg in enumerate(targets_to_run):
         target, I_show, ws_cos, cs, elapsed = run_one(
             cfg, xs, ys, loss_type=loss_type,
             depth_override=depth_override, lambda_caps=lambda_caps,
             n_modes=n_modes, n_act_per_side=n_act_per_side,
             freq_max=freq_max, n_freq=n_freq,
+            hos_M=hos_M, iters_scale=iters_scale,
         )
         depth_used = depth_override if depth_override is not None else cfg.depth
 
@@ -322,7 +368,19 @@ if __name__ == "__main__":
                              "Higher freqs resonantly excite higher-k modes.")
     parser.add_argument('--n_freq', type=int, default=N_FREQ,
                         help=f"Number of driving frequencies (default {N_FREQ}).")
+    parser.add_argument('--hos_M', type=int, default=None, choices=[1, 2],
+                        help="If set, use HOS forward at this order (1 or 2). "
+                             "Disables linear-regime validity warnings. ~50× "
+                             "slower per L-BFGS iter than linear forward.")
+    parser.add_argument('--iters_scale', type=float, default=1.0,
+                        help="Multiply each stage's iter count by this. Use "
+                             "e.g. 0.2 for a fast plumbing test (~5x fewer iters).")
+    parser.add_argument('--targets', nargs='*', default=None,
+                        help="Subset of targets to run (e.g. --targets 3spot_gaussian). "
+                             "Default: all four.")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
-         freq_max=args.freq_max, n_freq=args.n_freq)
+         freq_max=args.freq_max, n_freq=args.n_freq,
+         hos_M=args.hos_M, iters_scale=args.iters_scale,
+         targets_filter=args.targets)
