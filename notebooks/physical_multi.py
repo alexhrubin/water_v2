@@ -287,9 +287,14 @@ def run_one(cfg, xs, ys, loss_type='cosine',
 def main(loss_type='cosine', depth_override=None, no_caps=False,
          n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
          freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
-         hos_M=None, iters_scale=1.0, targets_filter=None):
-    lambda_caps = 0.0 if no_caps else LAMBDA_ETA
-    caps_tag = "nocaps" if no_caps else f"caps{LAMBDA_ETA:g}"
+         hos_M=None, iters_scale=1.0, targets_filter=None,
+         lambda_override=None):
+    if lambda_override is not None:
+        lambda_caps = lambda_override
+    else:
+        lambda_caps = 0.0 if no_caps else LAMBDA_ETA
+    caps_tag = ("nocaps" if lambda_caps == 0
+                else f"caps{lambda_caps:g}")
     depth_tag = f"d{depth_override}" if depth_override is not None else "dauto"
     parts = [loss_type, depth_tag, caps_tag]
     if n_modes != N_MODES:
@@ -404,9 +409,12 @@ if __name__ == "__main__":
     parser.add_argument('--targets', nargs='*', default=None,
                         help="Subset of targets to run (e.g. --targets 3spot_gaussian). "
                              "Default: all four.")
+    parser.add_argument('--lambda_slope', type=float, default=None,
+                        help=f"Override λ_eta and λ_slope (default {LAMBDA_ETA}, "
+                             "0 with --no_caps). Use ~10 for HOS-friendly soft cap.")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
          freq_max=args.freq_max, n_freq=args.n_freq,
          hos_M=args.hos_M, iters_scale=args.iters_scale,
-         targets_filter=args.targets)
+         targets_filter=args.targets, lambda_override=args.lambda_slope)
