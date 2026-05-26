@@ -17,9 +17,19 @@ Designed for Colab A100. Local dev uses small basis (n_modes ≤ 12,
 n_bins ≤ 20) to fit in CPU memory.
 
 Usage:
-    python notebooks/optimize_transient.py --target targets/ANNA.jpg
-    python notebooks/optimize_transient.py --target targets/dog_square.jpg \\
-        --depth 0.5 --n_bins 30 --T_eval 1.5 --iters 800
+    # Recommended validation config (apparatus we have results for in steady-state):
+    python notebooks/optimize_transient.py --target targets/ANNA.jpg \\
+        --depth 2.0 --n_modes 15 --n_act_per_side 12 \\
+        --T_eval 1.0 --n_bins 20 --iters 1500 --M 2
+
+    # Shallow tank (d=0.1m, n_modes ≥ 20) needs care: HOS M=2 polish can NaN
+    # due to nonlinear-mode-coupling overflow. Use --steady_iters 0 to skip
+    # the HOS polish on the baseline (analytical solve only) and let the
+    # transient pipeline carry the comparison. Lower lr (e.g. --lr 3e-4) and
+    # higher --lambda_slope also help.
+    python notebooks/optimize_transient.py --target targets/ANNA.jpg \\
+        --depth 0.1 --n_modes 20 --steady_iters 0 --lr 3e-4 \\
+        --T_eval 1.0 --n_bins 30 --iters 1500
 """
 
 import argparse
@@ -114,6 +124,14 @@ def run_steady_baseline(prop, target, Omega_freqs, args):
             loss_type=args.loss, full_snell=True, p0=p0,
             forward_fn=hos_fwd, check_validity=False,
         )
+        # NaN guard: HOS M=2 polish can overflow in shallow / high-mode regimes.
+        # Fall back to the analytical warm-start rather than poisoning everything
+        # downstream.
+        if not np.all(np.isfinite(np.asarray(params))):
+            print("  WARNING: steady polish produced non-finite params "
+                  "(HOS M=2 instability — common at shallow d + large n_modes). "
+                  "Falling back to analytical warm-start.")
+            params = p0
     else:
         params = p0
 
@@ -127,6 +145,13 @@ def run_steady_baseline(prop, target, Omega_freqs, args):
     a_steady = hos_fwd_fn(prop, P, jnp.asarray(Omega_freqs),
                            T_eval=args.T_eval_steady,
                            config=cfg, initial="steady")
+    if not np.all(np.isfinite(np.asarray(a_steady))):
+        print("  WARNING: steady-state HOS render produced NaN. "
+              "Re-rendering with M=1 (linear) for the baseline image only.")
+        cfg_lin = HOSConfig(M=1, steps_per_period=args.steps_per_period)
+        a_steady = hos_fwd_fn(prop, P, jnp.asarray(Omega_freqs),
+                               T_eval=args.T_eval_steady,
+                               config=cfg_lin, initial="steady")
     _, _, I_steady = caustic_image(prop, a_steady, sigma=args.sigma_render,
                                     full_snell=True, n_water=args.n_water)
     eta_steady, dx_s, dy_s = reconstruct_surface(prop, a_steady)
@@ -263,8 +288,9 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     # Steady baseline
     parser.add_argument('--T_eval_steady', type=float, default=1.0)
-    parser.add_argument('--steady_iters', type=int, default=200,
-                        help="Polish steps on the steady-state baseline (0 = skip polish)")
+    parser.add_argument('--steady_iters', type=int, default=100,
+                        help="Polish steps on the steady-state baseline (0 = skip polish; "
+                             "use 0 if HOS M=2 NaNs out at shallow depth)")
     parser.add_argument('--steady_lr', type=float, default=1e-3)
     # Loss + caps
     parser.add_argument('--loss', type=str, default='cosine', choices=['cosine', 'pearson'])

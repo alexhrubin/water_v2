@@ -369,11 +369,21 @@ def optimize_transient(
             return theta, opt_state, L
 
         desc = f"σ={stage.sigma:.3f} [transient]"
+        theta_last_finite = theta
         with tqdm(range(stage.iters), desc=desc, leave=True) as pbar:
             for _ in pbar:
                 theta, opt_state, L = step(theta, opt_state)
                 L_val = float(L)
                 loss_history.append(L_val)
                 pbar.set_postfix(loss=f"{L_val:.4f}")
+                if not math.isfinite(L_val):
+                    tqdm.write(
+                        f"  NaN/Inf loss at stage σ={stage.sigma:.3f} — "
+                        f"aborting stage, restoring last finite θ. "
+                        f"Lower lr, lower n_modes, raise lambda_slope, or use --M 1."
+                    )
+                    theta = theta_last_finite
+                    break
+                theta_last_finite = theta
 
     return np.asarray(theta), loss_history
