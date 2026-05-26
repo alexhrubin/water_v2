@@ -154,8 +154,9 @@ TARGETS = [
 
 
 def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
-                freq_max=FREQ_MAX_HZ, n_freq=N_FREQ):
-    tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING)
+                freq_max=FREQ_MAX_HZ, n_freq=N_FREQ, surface_tension=0.0):
+    tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING,
+                surface_tension=surface_tension)
     acts = []
     for i in range(n_act_per_side):
         t = (i + 1) / (n_act_per_side + 1)
@@ -184,16 +185,18 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
             n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
-            hos_M=None, iters_scale=1.0):
+            hos_M=None, iters_scale=1.0, surface_tension=0.0):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
+    st_label = f", σ/ρ={surface_tension:g}" if surface_tension > 0 else ""
     print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², "
           f"act={n_act_per_side}/side, freq=[{FREQ_MIN_HZ}-{freq_max}Hz]×{n_freq}, "
-          f"loss={loss_type}, caps={caps_str}, forward={forward_label})\n{'='*60}",
+          f"loss={loss_type}, caps={caps_str}, forward={forward_label}{st_label})\n{'='*60}",
           flush=True)
     prop, Omega = build_setup(depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
-                              freq_max=freq_max, n_freq=n_freq)
+                              freq_max=freq_max, n_freq=n_freq,
+                              surface_tension=surface_tension)
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
@@ -296,7 +299,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
          n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
          freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
          hos_M=None, iters_scale=1.0, targets_filter=None,
-         lambda_override=None):
+         lambda_override=None, surface_tension=0.0):
     if lambda_override is not None:
         lambda_caps = lambda_override
     else:
@@ -315,6 +318,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"hosM{hos_M}")
     if iters_scale != 1.0:
         parts.append(f"its{iters_scale:g}")
+    if surface_tension > 0:
+        parts.append(f"st{surface_tension:g}")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -355,6 +360,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             n_modes=n_modes, n_act_per_side=n_act_per_side,
             freq_max=freq_max, n_freq=n_freq,
             hos_M=hos_M, iters_scale=iters_scale,
+            surface_tension=surface_tension,
         )
         depth_used = depth_override if depth_override is not None else cfg.depth
 
@@ -420,9 +426,15 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_slope', type=float, default=None,
                         help=f"Override λ_eta and λ_slope (default {LAMBDA_ETA}, "
                              "0 with --no_caps). Use ~10 for HOS-friendly soft cap.")
+    parser.add_argument('--surface_tension', type=float, default=0.0,
+                        help="Surface tension σ/ρ in m³/s² (default 0.0 = pure gravity). "
+                             "For water at 20°C use 7.28e-5. Adds capillary contribution "
+                             "to the dispersion ω² = (gk + σ/ρ·k³)·tanh(kd); matters at "
+                             "λ ≲ 1.7 cm (shallow / high-mode regimes).")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
          freq_max=args.freq_max, n_freq=args.n_freq,
          hos_M=args.hos_M, iters_scale=args.iters_scale,
-         targets_filter=args.targets, lambda_override=args.lambda_slope)
+         targets_filter=args.targets, lambda_override=args.lambda_slope,
+         surface_tension=args.surface_tension)

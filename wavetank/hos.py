@@ -80,7 +80,12 @@ def steady_state_initial(
     a0, b0 : modal amplitudes [n_total]
     """
     omega = jnp.asarray(prop.omega)
-    sigma = omega**2 / prop.tank.g    # k·tanh(k·d) = ω²/g
+    # σ_j = k_j·tanh(k_j·d). Compute from wavenumber so the capillary case
+    # is handled correctly (ω²/g is only valid for pure gravity).
+    kx_flat = prop.mode_m * np.pi / prop.tank.Lx
+    ky_flat = prop.mode_n * np.pi / prop.tank.Ly
+    k_per_mode = np.sqrt(kx_flat**2 + ky_flat**2)
+    sigma = jnp.asarray(k_per_mode * np.tanh(k_per_mode * prop.tank.depth))
     gamma = prop.tank.damping
     Omega = jnp.asarray(Omega_freqs)
 
@@ -100,25 +105,29 @@ def steady_state_initial(
 
 def _rhs_M1(
     a: jnp.ndarray, b: jnp.ndarray, t: float,
-    omega: jnp.ndarray, sigma: jnp.ndarray, gamma: float, g: float,
+    omega: jnp.ndarray, sigma: jnp.ndarray, g_eff: jnp.ndarray, gamma: float,
     CP: jnp.ndarray, Omega: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     M=1 right-hand side. No mode coupling, no nonlinearity.
 
         ȧ_j = σ_j · b_j
-        ḃ_j = -g · a_j - 2γω_j · b_j + R_j(t)
+        ḃ_j = -g_eff_j · a_j - 2γω_j · b_j + R_j(t)
 
-    where R_j(t) = (g/ω_j²) · Σ_k Im((CP)[j,k] · exp(iΩ_k t)) is the
-    time-domain forcing whose steady-state matches the linear theory.
+    where σ_j = k_j·tanh(k_j·d) is the kinematic coefficient,
+    g_eff_j = g + (σ/ρ)·k_j² is the per-mode restoring acceleration
+    (reduces to g without capillarity), and
+    R_j(t) = (g_eff_j/ω_j²) · Σ_k Im((CP)[j,k] · exp(iΩ_k t))
+    is the time-domain forcing whose steady-state matches the linear
+    theory (ω² = g_eff · σ).
     """
-    # R_j(t) = (g/ω_j²) · Im(Σ_k (CP)[j,k] · e^{iΩ_k t})
+    # R_j(t) = (g_eff_j/ω_j²) · Im(Σ_k (CP)[j,k] · e^{iΩ_k t})
     phase = jnp.exp(1j * Omega * t)                        # [n_freq]
     F = jnp.imag(CP @ phase)                               # [n_total]
-    R = (g / omega**2) * F                                 # [n_total]
+    R = (g_eff / omega**2) * F                             # [n_total]
 
     da = sigma * b
-    db = -g * a - 2.0 * gamma * omega * b + R
+    db = -g_eff * a - 2.0 * gamma * omega * b + R
     return da, db
 
 
@@ -149,7 +158,7 @@ def _project_to_modes(
 
 def _rhs_M2(
     a: jnp.ndarray, b: jnp.ndarray, t: float,
-    omega: jnp.ndarray, sigma: jnp.ndarray, gamma: float, g: float,
+    omega: jnp.ndarray, sigma: jnp.ndarray, g_eff: jnp.ndarray, gamma: float,
     CP: jnp.ndarray, Omega: jnp.ndarray,
     prop: Propagator,
     k2_flat: jnp.ndarray,
@@ -170,7 +179,7 @@ def _rhs_M2(
     Dealiasing: only modes inside ``dealias_mask`` (a [n_total] boolean
     array) contribute to the nonlinear inputs. See HOSConfig.dealias_ratio.
     """
-    da_lin, db_lin = _rhs_M1(a, b, t, omega, sigma, gamma, g, CP, Omega)
+    da_lin, db_lin = _rhs_M1(a, b, t, omega, sigma, g_eff, gamma, CP, Omega)
 
     # Dealias the inputs to nonlinear products (1/2-rule for cosine basis).
     a_in = jnp.where(dealias_mask, a, 0.0)
@@ -247,18 +256,28 @@ def hos_forward(
         )
 
     omega = jnp.asarray(prop.omega)
-    sigma = omega**2 / prop.tank.g
     gamma = prop.tank.damping
     g     = prop.tank.g
+    st    = prop.tank.surface_tension
     Omega = jnp.asarray(Omega_freqs)
     CP    = jnp.asarray(prop.C) @ P                # [n_total, n_freq], complex
+
+    # Per-mode kinematics. Compute σ_j = k_j·tanh(k_j·d) from wavenumber
+    # directly so the capillary case is handled (where ω² ≠ g·k·tanh(kd)).
+    # g_eff_j = g + (σ/ρ)·k_j² is the dispersion-consistent restoring
+    # acceleration. Both reduce to the gravity-only forms when st=0.
+    Lx_t, Ly_t = prop.tank.Lx, prop.tank.Ly
+    kx_flat = prop.mode_m * np.pi / Lx_t
+    ky_flat = prop.mode_n * np.pi / Ly_t
+    k2_per_mode = kx_flat**2 + ky_flat**2
+    k_per_mode = np.sqrt(k2_per_mode)
+    sigma = jnp.asarray(k_per_mode * np.tanh(k_per_mode * prop.tank.depth))
+    g_eff = jnp.asarray(g + st * k2_per_mode)
 
     # M=2 precomputations: k_j² per flat mode + per-mode (1/N_j).
     if config.M >= 2:
         Lx, Ly = prop.tank.Lx, prop.tank.Ly
-        kx = prop.mode_m * np.pi / Lx
-        ky = prop.mode_n * np.pi / Ly
-        k2_flat = jnp.asarray(kx**2 + ky**2)
+        k2_flat = jnp.asarray(k2_per_mode)
         # N_j = (Lx / α_m)(Ly / α_n), α=1 if index==0 else 2
         alpha_m = np.where(prop.mode_m == 0, 1.0, 2.0)
         alpha_n = np.where(prop.mode_n == 0, 1.0, 2.0)
@@ -308,8 +327,8 @@ def hos_forward(
     # ── RK4 inner step ────────────────────────────────────────────────
     def rhs(a, b, t):
         if config.M == 1:
-            return _rhs_M1(a, b, t, omega, sigma, gamma, g, CP, Omega)
-        return _rhs_M2(a, b, t, omega, sigma, gamma, g, CP, Omega,
+            return _rhs_M1(a, b, t, omega, sigma, g_eff, gamma, CP, Omega)
+        return _rhs_M2(a, b, t, omega, sigma, g_eff, gamma, CP, Omega,
                        prop, k2_flat, inv_N_flat, dx, dy, dealias_mask)
 
     def step(state, _):

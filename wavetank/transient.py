@@ -42,26 +42,28 @@ def _bin_index(t: float, dt_bin: float, n_bins: int) -> jnp.ndarray:
     )
 
 
-def _rhs_M1_transient(a, b, t, omega, sigma_mode, gamma, g, C, theta, dt_bin, n_bins):
+def _rhs_M1_transient(a, b, t, omega, sigma_mode, g_eff, gamma, C, theta, dt_bin, n_bins):
     """M=1 RHS with piecewise-constant time-varying drive.
 
     ȧ = σ b
-    ḃ = -g a - 2γω b + R(t)
-    R_j(t) = (g/ω_j²) · Σ_i C[j,i] · θ[i, bin(t)]
+    ḃ = -g_eff a - 2γω b + R(t)
+    R_j(t) = (g_eff_j/ω_j²) · Σ_i C[j,i] · θ[i, bin(t)]
+
+    g_eff_j = g + (σ/ρ)·k_j² reduces to g without capillarity.
     """
     bin_idx = _bin_index(t, dt_bin, n_bins)
     f_t = theta[:, bin_idx]                  # [n_act] — current displacement
     F = C @ f_t                              # [n_total]
-    R = (g / omega**2) * F                   # [n_total]
+    R = (g_eff / omega**2) * F               # [n_total]
 
     da = sigma_mode * b
-    db = -g * a - 2.0 * gamma * omega * b + R
+    db = -g_eff * a - 2.0 * gamma * omega * b + R
     return da, db
 
 
 def _rhs_M2_transient(
     a, b, t,
-    omega, sigma_mode, gamma, g, C, theta, dt_bin, n_bins,
+    omega, sigma_mode, g_eff, gamma, C, theta, dt_bin, n_bins,
     prop, k2_flat, inv_N_flat, dx, dy, dealias_mask,
 ):
     """M=2 RHS — M=1 linear part + Dommermuth–Yue quadratic corrections.
@@ -70,7 +72,7 @@ def _rhs_M2_transient(
     forcing replacing the steady-state phasor sum.
     """
     da_lin, db_lin = _rhs_M1_transient(
-        a, b, t, omega, sigma_mode, gamma, g, C, theta, dt_bin, n_bins,
+        a, b, t, omega, sigma_mode, g_eff, gamma, C, theta, dt_bin, n_bins,
     )
 
     a_in = jnp.where(dealias_mask, a, 0.0)
@@ -137,17 +139,23 @@ def hos_forward_transient(
     T_eval = float(n_bins) * dt_bin
 
     omega = jnp.asarray(prop.omega)
-    sigma_mode = omega ** 2 / prop.tank.g      # σ_j = k_j tanh(k_j d) = ω²/g
     gamma = prop.tank.damping
     g = prop.tank.g
+    st = prop.tank.surface_tension
     C = jnp.asarray(prop.C)
+
+    # Per-mode kinematics — compute from wavenumber so capillary case works.
+    kx_flat = prop.mode_m * np.pi / prop.tank.Lx
+    ky_flat = prop.mode_n * np.pi / prop.tank.Ly
+    k2_per_mode = kx_flat ** 2 + ky_flat ** 2
+    k_per_mode = np.sqrt(k2_per_mode)
+    sigma_mode = jnp.asarray(k_per_mode * np.tanh(k_per_mode * prop.tank.depth))
+    g_eff = jnp.asarray(g + st * k2_per_mode)
 
     # M=2 precomputations
     if M >= 2:
         Lx, Ly = prop.tank.Lx, prop.tank.Ly
-        kx = prop.mode_m * np.pi / Lx
-        ky = prop.mode_n * np.pi / Ly
-        k2_flat = jnp.asarray(kx ** 2 + ky ** 2)
+        k2_flat = jnp.asarray(k2_per_mode)
         alpha_m = np.where(prop.mode_m == 0, 1.0, 2.0)
         alpha_n = np.where(prop.mode_n == 0, 1.0, 2.0)
         N_flat = (Lx / alpha_m) * (Ly / alpha_n)
@@ -172,10 +180,10 @@ def hos_forward_transient(
     def rhs(a, b, t):
         if M == 1:
             return _rhs_M1_transient(
-                a, b, t, omega, sigma_mode, gamma, g, C, theta, dt_bin, n_bins,
+                a, b, t, omega, sigma_mode, g_eff, gamma, C, theta, dt_bin, n_bins,
             )
         return _rhs_M2_transient(
-            a, b, t, omega, sigma_mode, gamma, g, C, theta, dt_bin, n_bins,
+            a, b, t, omega, sigma_mode, g_eff, gamma, C, theta, dt_bin, n_bins,
             prop, k2_flat, inv_N_flat, dx_grid, dy_grid, dealias_mask,
         )
 

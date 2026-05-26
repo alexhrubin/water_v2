@@ -58,6 +58,13 @@ class Tank:
     damping: float = 0.02   # modal damping ratio γ
     g: float = 9.81     # gravitational acceleration (m/s²)
     projection_distance: float | None = None  # optical throw (m); None → depth
+    surface_tension: float = 0.0
+        # Surface tension over density σ/ρ (m³/s²). Adds the capillary
+        # term to the dispersion: ω² = (gk + σ/ρ·k³)·tanh(kd). Default 0.0
+        # is pure gravity (backward compatible). For water at 20°C use
+        # σ/ρ ≈ 7.28e-5 m³/s²; the gravity↔capillary crossover is at
+        # λ ≈ 1.7 cm, so the term matters in shallow / short-wavelength
+        # regimes and is negligible for our typical d=2m runs.
 
     @property
     def throw(self) -> float:
@@ -131,6 +138,7 @@ def build_propagator(
     nx, ny    : spatial grid resolution
     """
     Lx, Ly, depth, g = tank.Lx, tank.Ly, tank.depth, tank.g
+    st = tank.surface_tension     # σ/ρ; 0.0 = pure gravity
     n_act = len(actuators)
 
     # ── Collect mode indices, skip (0,0) ──────────────────────────────
@@ -145,9 +153,10 @@ def build_propagator(
     mode_n = np.array(ns, dtype=np.int32)
     n_total = len(mode_m)
 
-    # ── Natural frequencies (gravity-wave dispersion relation) ─────────
+    # ── Natural frequencies (gravity, or capillary-gravity if st > 0) ──
+    # Dispersion: ω² = (g·k + σ/ρ · k³) · tanh(k·d)
     k = np.sqrt((mode_m * np.pi / Lx)**2 + (mode_n * np.pi / Ly)**2)
-    omega = np.sqrt(g * k * np.tanh(k * depth))
+    omega = np.sqrt((g * k + st * k**3) * np.tanh(k * depth))
 
     # ── Mode normalization: N_{m,n} = ∫∫ φ_{m,n}² dx dy ─────────────
     def norm_mn(m, n):
