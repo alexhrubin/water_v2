@@ -79,6 +79,13 @@ from .hos import (
     hos_forward,
     steady_state_initial,
 )
+from .transient import (
+    hos_forward_transient,
+    warm_start_from_steady,
+    make_transient_loss,
+    optimize_transient,
+    TransientStage,
+)
 from .inverse_render import (
     caustic_from_eta,
     optimize_eta_for_target,
@@ -104,6 +111,8 @@ __all__ = [
     "generate_training_data", "train_correction",
     "make_corrected_loss", "save_model", "load_model",
     "HOSConfig", "hos_forward", "steady_state_initial",
+    "hos_forward_transient", "warm_start_from_steady",
+    "make_transient_loss", "optimize_transient", "TransientStage",
     "caustic_from_eta", "optimize_eta_for_target",
     "optimize_modal_eta_for_target",
 ]
