@@ -17,7 +17,7 @@ Designed for Colab A100. Local dev uses small basis (n_modes ≤ 12,
 n_bins ≤ 20) to fit in CPU memory.
 
 Usage:
-    python notebooks/optimize_transient.py --target targets/3spot_gaussian.npy
+    python notebooks/optimize_transient.py --target targets/ANNA.jpg
     python notebooks/optimize_transient.py --target targets/dog_square.jpg \\
         --depth 0.5 --n_bins 30 --T_eval 1.5 --iters 800
 """
@@ -37,7 +37,6 @@ from wavetank import (
     Tank, Actuator, build_propagator,
     steady_state_amplitudes, caustic_image, reconstruct_surface,
     unpack_complex,
-    load_target_image,
     analytical_solve,
     Stage, optimize_caustic, make_hos_forward,
     hos_forward_transient, warm_start_from_steady,
@@ -63,19 +62,20 @@ def make_apparatus(args):
 
 
 def load_target(path, nx, ny):
-    """Load and resize target to (nx, ny)."""
+    """Load and resize a target image (or .npy) to (nx, ny), values in [0, 1]."""
+    from PIL import Image
     p = Path(path)
-    if p.suffix in ('.npy',):
-        target = np.load(p)
+    if p.suffix == '.npy':
+        target = np.load(p).astype(np.float32)
         if target.shape != (nx, ny):
-            from PIL import Image
-            img = Image.fromarray((target * 255).astype(np.uint8))
+            img = Image.fromarray((np.clip(target, 0, 1) * 255).astype(np.uint8))
             img = img.resize((ny, nx), Image.BICUBIC)
             target = np.array(img, dtype=np.float32) / 255.0
     else:
-        target = load_target_image(p, nx, ny)
-    target = np.clip(target.astype(np.float64), 0.0, 1.0)
-    return target
+        img = Image.open(p).convert('L')
+        img = img.resize((ny, nx), Image.BICUBIC)              # PIL: (width, height)
+        target = np.array(img, dtype=np.float32) / 255.0
+    return np.clip(target.astype(np.float64), 0.0, 1.0)
 
 
 def cos_sim(I, T):
