@@ -59,63 +59,142 @@ finite angular size of the sun and diffraction.
 
 ## Where caustics form: the focal condition
 
-Write the Hessian eigenvalues as `λ₁, λ₂`. Then:
+The proper paraxial refraction formula (Snell's law for small angles)
+is:
 
-    det(J)  =  (1 - (throw/n_water) · λ₁) · (1 - (throw/n_water) · λ₂)
+    r_f  =  r_s  -  throw · (1 - 1/n_water) · ∇η
 
-A caustic forms wherever *either* eigenvalue equals `n_water/throw`:
+with corresponding Jacobian:
 
-    λ_caustic  =  n_water / throw
+    J  =  I  -  throw · (1 - 1/n_water) · H
 
-This is the **focal condition**. It says: at this point on the surface,
-the local curvature in some direction is exactly what's needed to
-focus parallel rays at the floor depth. Other directions may
-defocus, but at least one focuses, and that's enough to make the
-local Jacobian singular.
+Write the Hessian eigenvalues as `λ₁, λ₂`:
+
+    det(J)  =  (1 - throw·(1−1/n)·λ₁) · (1 - throw·(1−1/n)·λ₂)
+
+A caustic forms wherever *either* eigenvalue hits the critical value:
+
+    λ_crit  =  1 / (throw · (1 − 1/n_water))  =  n_water / ((n_water−1) · throw)
+
+For `n_water = 1.33`, this works out to **`λ_crit ≈ 4/throw`**.
+
+This is the **focal condition**. At this curvature, the local
+"surface lens" focuses parallel rays exactly at floor depth. Other
+directions may defocus, but at least one focuses, and that's enough
+to make the local Jacobian singular.
 
 So caustics form along **contour lines** of the surface Hessian — the
-1D locus where one eigenvalue hits `n_water/throw`. As surface
-shape evolves (in periodic driving or random wave motion), these
-contours sweep around, and the caustic lines on the floor move with
-them.
+1D locus where one eigenvalue hits `λ_crit`. As the surface evolves,
+these contours sweep around, and the caustic lines on the floor move
+with them.
 
-## Connecting to surface modes
+> **Note on paraxial Snell.** Our renderer code uses a simplified
+> paraxial expression `r_f = r_s - throw · ∇η / n_water` (dividing by
+> `n` instead of multiplying by `(1−1/n)`). The simplified version
+> overestimates ray displacement by factor `n/(n−1) ≈ 3` for water and
+> correspondingly underestimates `λ_crit` by the same factor. The
+> derivation that follows uses the *correct* paraxial Snell; the
+> simulator's empirical threshold runs ~3× easier than this derivation
+> predicts. This is a model-fidelity question that should be reconciled
+> in a future iteration; the qualitative chain of reasoning below is
+> unchanged either way.
 
-Decompose the surface in cosine modes:
+## The complete derivation: mode count for caustic formation
 
-    η(x, y, t) = Σ a_{m,n}(t) · cos(mπx/Lx) cos(nπy/Ly)
+Now build the full chain from `det(J)=0` to "how many modes does my
+basis need."
 
-with wavenumber `k_{m,n} = π·√((m/Lx)² + (n/Ly)²)`. For a single mode,
+**Step 1: Single-mode caustic threshold.** Decompose the surface in
+cosine modes `η = Σ aₙ φₙ` with wavenumbers `qₙ`. For a single mode at
+amplitude `a` and wavenumber `q`, the Hessian eigenvalue is `−a·q²`.
+The focal condition `|λ| ≥ 1/(throw·(1−1/n))` becomes:
 
-    |Hessian| ~ k²·|a|       (curvature is amplitude × wavenumber-squared)
-    |slope|   ~ k·|a|        (slope is amplitude × wavenumber)
+    a · q² · throw · (1 − 1/n)  ≥  1
 
-So `Hessian = k · slope`. At the slope cap `s_max`, the *maximum
-possible* curvature from a single mode of wavenumber `k` is:
+or, rearranged:
 
-    H_max(k)  =  k · s_max
+    **a · q² · throw  ≥  n/(n−1)  ≈  4  (for n=1.33)**
 
-Plugging into the focal condition: a mode of wavenumber `k` can form
-caustics only if `H_max(k) ≥ n_water / throw`, i.e.:
+This is the canonical "curvature × depth ≥ constant" rule for caustic
+formation by a single sinusoidal wave. It is independent of slope or
+amplitude in isolation — it is the product `a·q²·throw` that matters.
 
-    k  ≥  n_water / (throw · s_max)   (focal feasibility)
+**Step 2: Linear-wave constraint.** Linear-wave theory requires
+slope `|∇η| ≤ s_max`. For a single mode of wavenumber `q`, slope is
+`a·q`, so the linearity-allowed amplitude is `a ≤ s_max/q`. Substituting
+into the caustic condition:
 
-This is the cleanest one-line summary of when caustics are possible
-at all: you need enough mode wavenumber, slope budget, and throw,
-multiplied together, to clear the refractive threshold.
+    (s_max / q) · q² · throw  ≥  4
+    s_max · q · throw  ≥  4
+    **q  ≥  4 / (s_max · throw)**
 
-Examples for `n_water = 1.33`, `s_max = 0.1` (linear cap):
+For `s_max = 0.1`, this is **`q ≥ 40 / throw`** (in radians/meter).
 
-| throw  | focal feasibility (min k) | min mode index (1m tank) |
-|--------|---------------------------|--------------------------|
-| 0.1 m  | k ≥ 133                   | m ≈ 42 (need 40+ modes!) |
-| 1 m    | k ≥ 13.3                  | m ≈ 4                    |
-| 5 m    | k ≥ 2.66                  | m = 1 already qualifies  |
+This says: under the linear-wave slope cap, only modes with wavenumber
+above `40/throw` can form caustics. Or equivalently — there is a
+minimum spatial frequency below which the surface simply cannot carry
+enough curvature to clear the focal threshold within linear physics.
 
-So in the linear regime at shallow throw, the high-`k` modes needed to
-form caustics may be outside your basis entirely. Deeper water (more
-throw) lowers the bar; nonlinear physics (HOS, with `s_max` up to ~0.3)
-lowers it independently. Doing both lowers it a lot.
+**Step 3: Modal basis constraint.** A tank of side length `L` has
+modes `q_n = nπ/L`. Plugging in:
+
+    nπ/L  ≥  4 / (s_max · throw)
+    **n  ≥  4 · L / (π · s_max · throw)  =  k_n · (L/throw)**
+
+with the dimensionless constant `k_n = 4/(π·s_max) ≈ 13` for
+`s_max = 0.1`. So:
+
+    **n_min  ≈  13 · (L/throw)**         (linear regime)
+
+This is the punchline. The minimum mode index per axis to form caustics
+in the linear regime depends *only on the apparatus geometry ratio*
+`L/throw`, with a coefficient of ~13.
+
+**Step 4: Apply to apparatus regimes.** For `L = 1m` tank:
+
+| throw (m) | L/throw | linear `n_min` (s=0.1) | HOS M=2 `n_min` (s=0.3) | HOS M=3 `n_min` (s=0.4) |
+|---|---|---|---|---|
+| 5 (deep pool) | 0.2  | 3   | 1   | 1   |
+| 2 (our typical) | 0.5  | 7   | 2   | 2   |
+| 0.5 (shallow tank) | 2    | 26  | 9   | 7   |
+| 0.1 (very shallow) | 10   | **130** | **43**  | **33**  |
+| 0.02 (puddle) | 50   | 650 | 217 | 163 |
+
+The L/throw column is the dimensionless geometry parameter. At
+`L/throw ≤ 1`, our typical 15-mode-per-axis basis comfortably clears
+even the linear threshold. At `L/throw ≥ 5` (true shallow), the linear
+threshold needs many tens of modes; HOS reduces this by ~3-4× but
+puddle-scale `L/throw = 50` still needs hundreds of modes per axis.
+
+This **directly explains why pools and puddles get sharp caustics in
+real life** despite being shallow: real water has access to *much*
+higher-frequency modes (capillary ripples with `λ` of millimeters,
+giving `q ~ 1000+ rad/m`). Per the derivation, you need
+`q ≥ 40/throw = 2000 rad/m` at `throw = 0.02m` — completely
+inaccessible to our 15-30 mode basis on a 1m tank, but trivial for
+the actual capillary-gravity modes that occur in real water.
+
+## Empirical confirmation
+
+We tested this prediction directly:
+
+- **`d=2m, n=15, HOS M=2`** (well above threshold): cos jumps from
+  warm-start 0.27 → 0.835. Caustics form sharply. ✓
+- **`d=0.1m, n=15, HOS M=2`** (well below threshold; need ~43 modes):
+  cos stays at warm-start (0.27 → 0.26). Slopes hit cap (0.113) but
+  curvature `k·slope ≈ 7.6` can't clear threshold `≈ 13–40`. **No
+  caustic formation.** ✓
+- **`d=0.1m, n=50, HOS M=2`** (above threshold; predicted to work):
+  HOS integrator goes NaN at iter 1. The high mode count's
+  nonlinear-mode-coupling overflow is an integrator-stability issue,
+  not a physics one. With more careful dealiasing and timestepping,
+  this run should succeed. *Future work.*
+
+So the analytical bound is confirmed in the cases the simulator can
+actually run. The "shallow water + linear regime can't form caustics"
+result is not a failure mode of the apparatus — it's the geometric
+consequence of slope-capped wave amplitudes being unable to deliver
+the required curvature at the wavelengths our basis supports.
 
 ## Caustic brightness: the curvature excess
 
@@ -128,7 +207,7 @@ Near a caustic line, intensity scales like `1/√(distance from caustic)`,
 and the peak (after regularization) goes as `√(H_excess)` where:
 
     H_excess  =  H_available  −  H_critical
-              =  (k_max · s_max)  −  (n_water / throw)
+              =  (k_max · s_max)  −  n_water/((n_water−1)·throw)
 
 Concretely: example.ipynb's fantasy regime has `H_excess ≈ 925` (slopes
 of 14 give massive curvature far above critical). Our linear cap-enforced

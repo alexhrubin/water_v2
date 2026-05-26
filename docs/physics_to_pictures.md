@@ -109,9 +109,9 @@ These combine into the **maximum available curvature** at any single mode:
     H_available  =  k_max_available · s_max
 
 and the **focal threshold** that must be cleared for caustics to form
-at all:
+at all (from full paraxial Snell, derived in `caustic_math.md`):
 
-    H_required   =  n_water / throw
+    H_required   =  n_water / ((n_water − 1) · throw)  ≈  4/throw
 
 The cleanest one-line summary of "can this apparatus produce caustics?":
 
@@ -145,6 +145,36 @@ The empirical work in this project has tested most of these:
   - Actuator count / freq range: 12-side / 5Hz → 20-side / 10Hz (tiny gain)
   - Depth: 0.12m → 2-5m (large gain — this was the main physical lever)
   - HOS M=2: in progress (substantial gain — see Section 4)
+
+### The mode-count threshold
+
+Substituting `a ≤ s_max/q` (linearity constraint) and `q_n = nπ/L`
+(modal basis) into the focal condition `a·q²·throw ≥ n/(n−1)` gives
+the **minimum mode index per axis to form any caustic at all**:
+
+    n_min  ≈  k_phys · (L / throw)
+
+with `k_phys = 4/(π·s_max·(1−1/n_water))`. For water (`n=1.33`):
+
+  - Linear regime (`s_max = 0.1`): `k_phys ≈ 13` → `n_min ≈ 13·(L/throw)`
+  - HOS M=2  (`s_max = 0.3`):     `k_phys ≈ 4.3` → `n_min ≈ 4·(L/throw)`
+  - HOS M=3  (`s_max = 0.4`):     `k_phys ≈ 3.2` → `n_min ≈ 3·(L/throw)`
+
+A clean dimensionless one-liner: caustic formation requires
+`n_modes ≥ k_phys · (L/throw)`. The deeper the apparatus relative
+to its width (small L/throw), the fewer modes you need. The shallower
+the apparatus (large L/throw), the more high-`q` modes you need to
+clear the threshold. HOS reduces the requirement by 3-4×.
+
+This is why pools and puddles (`L/throw = 10–50`) need real high-`q`
+content to produce caustics, why our `d=2m` tank (`L/throw = 0.5`)
+works easily even in linear regime with 15 modes, and why our `d=0.1m`
+tank (`L/throw = 10`) needs ≥130 modes in linear or ≥43 in HOS M=2 —
+which we don't currently have in our basis.
+
+See `docs/caustic_math.md` ("The complete derivation") for the full
+chain from `det(J)=0` to the mode-count threshold, including
+empirical confirmation on our actual runs.
 
 ---
 
