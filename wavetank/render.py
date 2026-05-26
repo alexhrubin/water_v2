@@ -144,12 +144,17 @@ def _paraxial_landing(
     """
     Paraxial (small-angle) refraction approximation.
 
-    x_land ≈ x + (throw - η) · (∂η/∂x) / n_water
+    x_land ≈ x + (throw - η) · (∂η/∂x) · (1 - 1/n_water)
+
+    The (1 - 1/n_water) factor is the standard paraxial Snell deflection
+    coefficient for an air-to-water interface (taking small angles of the
+    full vector formula `d_t · ẑ_perp = (1-1/n)·∇η`). This matches
+    ``snell_landing`` in the small-slope limit.
 
     ``throw`` is the optical projection distance (= tank.throw); see
     ``snell_landing`` for the physical interpretation.
     """
-    ratio = 1.0 / n_water
+    ratio = 1.0 - 1.0 / n_water        # paraxial Snell deflection coefficient
     x_land = X_src + (throw - eta) * deta_dx * ratio
     y_land = Y_src + (throw - eta) * deta_dy * ratio
     return x_land, y_land
@@ -377,11 +382,12 @@ def _caustic_bwd(prop, n_water, sigma, cutoff_sigmas, full_snell, residuals, g):
         _, vjp_fn = jax.vjp(_snell_fn, eta, deta_dx, deta_dy)
         dL_deta, dL_detax, dL_detay = vjp_fn((dL_dxl, dL_dyl))
     else:
-        inv_n = 1.0 / n_water_r
-        scale = (throw - eta) * inv_n
+        # Paraxial Snell deflection coefficient (matches _paraxial_landing).
+        coeff = 1.0 - 1.0 / n_water_r
+        scale = (throw - eta) * coeff
         dL_detax = dL_dxl * scale
         dL_detay = dL_dyl * scale
-        dL_deta  = -dL_dxl * deta_dx * inv_n - dL_dyl * deta_dy * inv_n
+        dL_deta  = -dL_dxl * deta_dx * coeff - dL_dyl * deta_dy * coeff
 
     # ── Step 3 adjoint: surface reconstruction ───────────────────────
     dL_da = _reconstruct_adjoint(prop, dL_deta, dL_detax, dL_detay)

@@ -28,9 +28,12 @@ S_MAX = {
 }
 
 # Empirical mapping from "brightness factor" √(H_excess/H_required) to cos.
-# Calibrated on the data: 3spot at three regimes (linear/HOS/fantasy) gave
-# (bf, cos) ≈ (3.0, 0.625), (5.4, 0.835), (8.3, 0.97). cos = 1 - exp(-bf/3)
-# fits these to ±0.05. Other targets land within ±0.10 of this curve.
+# Calibration NOTE: the original BF_SCALE = 3.0 was fit when both this script
+# and the renderer used the buggy paraxial threshold H_req ≈ n/throw. With the
+# corrected paraxial Snell (H_req ≈ n/((n−1)·throw), ~3× higher), brightness
+# factors shrink by ~√3, so this scale needs recalibration against re-run
+# empirical sweeps. Use predictions as relative ordering, not absolute cos,
+# until then.
 BF_SCALE = 3.0
 
 
@@ -81,12 +84,12 @@ def predict(target_path, Lx=1.0, depth=2.0, n_modes=15, energy_fraction=0.95):
                             energy_fraction=energy_fraction)
     k_avail = math.pi * math.sqrt(2 * n_modes ** 2) / Lx    # at mode (n_modes, n_modes)
     throw   = depth                                          # no glass bottom
-    H_req   = N_WATER / throw                                # focal threshold
+    H_req   = N_WATER / ((N_WATER - 1.0) * throw)            # paraxial focal threshold
 
     print(f"\nTarget: {target_path}")
     print(f"Apparatus: Lx={Lx}m, depth={depth}m, n_modes={n_modes}² → k_max={k_avail:.1f}")
     print(f"Target needs k ≥ {k_need:.1f} for {energy_fraction:.0%} of its energy")
-    print(f"Caustic-formation threshold: H_required = n/throw = {H_req:.3f}/m\n")
+    print(f"Caustic-formation threshold: H_required = n/((n−1)·throw) = {H_req:.3f}/m\n")
 
     rows = []
     for regime in ['linear', 'hos_m2', 'fantasy']:

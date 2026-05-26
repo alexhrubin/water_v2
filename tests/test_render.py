@@ -74,7 +74,10 @@ def _grad_check_through_params(prop, Omega, full_snell, sigma):
 
     g_analytic = jax.grad(loss_fn)(params)
     v = jax.random.normal(jax.random.PRNGKey(9), shape=params.shape)
-    eps = 1e-4
+    # eps=1e-5 needed because the paraxial gradient is small (the deflection
+    # coefficient is (1-1/n)≈0.25), so larger eps gets swamped by bilinear-splat
+    # discretization noise. Below 1e-5 FD matches analytic to ~1e-8.
+    eps = 1e-5
     fd = (float(loss_fn(params + eps * v)) - float(loss_fn(params - eps * v))) / (2 * eps)
     analytic = float(jnp.sum(g_analytic * v))
     rel = abs(analytic - fd) / max(abs(fd), 1e-8)

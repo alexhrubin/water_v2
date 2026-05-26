@@ -16,13 +16,16 @@ the floor.
 
 In coordinates, write `r_s = (x, y)` for the horizontal position where a
 ray enters the surface, and `r_f` for where the same ray lands on the
-floor. The map is:
+floor. The paraxial (small-slope) map is:
 
-    r_f(r_s)  =  r_s  -  (throw / n_water) · ∇η(r_s)         (paraxial)
+    r_f(r_s)  =  r_s  +  throw · (1 - 1/n_water) · ∇η(r_s)        (paraxial)
 
 where `η(x, y)` is the surface elevation, `∇η` is its horizontal
 gradient, `throw` is the optical distance from surface to floor, and
-`n_water ≈ 1.33`. (The full vector Snell's law is the same to leading
+`n_water ≈ 1.33`. The deflection coefficient `(1 - 1/n) ≈ 0.248` comes
+from Snell's law: a vertical ray hitting a surface tilted by slope `s`
+refracts at the air-water interface and emerges at angle `(1-1/n)·s`
+from vertical. (The full vector Snell's law reduces to this to leading
 order; corrections are quadratic in slope.)
 
 So the map is determined entirely by `∇η`. A flat surface (∇η = 0)
@@ -41,7 +44,7 @@ rays per unit area arrive there*. By change of variables:
 where `J = ∂r_f/∂r_s` is the **2×2 Jacobian** of the ray map.
 Computing it from the paraxial formula:
 
-    J  =  I_{2×2}  -  (throw / n_water) · H
+    J  =  I_{2×2}  +  throw · (1 - 1/n_water) · H
 
 where `H = ∇∇η` is the **Hessian** of the surface (the 2×2 matrix of
 second partial derivatives). Three regimes:
@@ -87,17 +90,6 @@ So caustics form along **contour lines** of the surface Hessian — the
 1D locus where one eigenvalue hits `λ_crit`. As the surface evolves,
 these contours sweep around, and the caustic lines on the floor move
 with them.
-
-> **Note on paraxial Snell.** Our renderer code uses a simplified
-> paraxial expression `r_f = r_s - throw · ∇η / n_water` (dividing by
-> `n` instead of multiplying by `(1−1/n)`). The simplified version
-> overestimates ray displacement by factor `n/(n−1) ≈ 3` for water and
-> correspondingly underestimates `λ_crit` by the same factor. The
-> derivation that follows uses the *correct* paraxial Snell; the
-> simulator's empirical threshold runs ~3× easier than this derivation
-> predicts. This is a model-fidelity question that should be reconciled
-> in a future iteration; the qualitative chain of reasoning below is
-> unchanged either way.
 
 ## The complete derivation: mode count for caustic formation
 
