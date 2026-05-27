@@ -81,7 +81,7 @@ var helperFunctions = '\
     }\
     \
     scale /= length(point); /* pool ambient occlusion */\
-    scale *= 1.0 - 0.9 / pow(length(point - sphereCenter) / sphereRadius, 4.0); /* sphere ambient occlusion */\
+    if (sphereRadius > 0.0) scale *= 1.0 - 0.9 / pow(length(point - sphereCenter) / sphereRadius, 4.0); /* sphere ambient occlusion (skipped when no sphere) */\
     \
     /* caustics */\
     vec3 refractedLight = -refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);\
@@ -271,13 +271,17 @@ function Renderer() {
       vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);\
       \
       /* compute a blob shadow and make sure we only draw a shadow if the player is blocking the light */\
-      vec3 dir = (sphereCenter - newPos) / sphereRadius;\
-      vec3 area = cross(dir, refractedLight);\
-      float shadow = dot(area, area);\
-      float dist = dot(dir, -refractedLight);\
-      shadow = 1.0 + (shadow - 1.0) / (0.05 + dist * 0.025);\
-      shadow = clamp(1.0 / (1.0 + exp(-shadow)), 0.0, 1.0);\
-      shadow = mix(1.0, shadow, clamp(dist * 2.0, 0.0, 1.0));\
+      /* skipped when no sphere (sphereRadius==0) to avoid divide-by-zero NaN that produced a square shadow artifact */\
+      float shadow = 1.0;\
+      if (sphereRadius > 0.0) {\
+        vec3 dir = (sphereCenter - newPos) / sphereRadius;\
+        vec3 area = cross(dir, refractedLight);\
+        shadow = dot(area, area);\
+        float dist = dot(dir, -refractedLight);\
+        shadow = 1.0 + (shadow - 1.0) / (0.05 + dist * 0.025);\
+        shadow = clamp(1.0 / (1.0 + exp(-shadow)), 0.0, 1.0);\
+        shadow = mix(1.0, shadow, clamp(dist * 2.0, 0.0, 1.0));\
+      }\
       gl_FragColor.g = shadow;\
       \
       /* shadow for the rim of the pool */\
