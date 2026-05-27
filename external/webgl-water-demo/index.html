@@ -11,12 +11,18 @@ Released under the MIT license
   <meta charset="utf8">
   <title>WebGL Water</title>
   <meta name="viewport" content="initial-scale=1.0, user-scalable=no">
+  <!-- Aggressive cache-busting: Python's http.server doesn't send no-cache,
+       so without this the browser will happily serve stale JS after edits. -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <script>var _cb = Date.now();</script>
   <script src="OES_texture_float_linear-polyfill.js"></script>
   <script src="lightgl.js"></script>
   <script src="cubemap.js"></script>
-  <script src="renderer.js"></script>
-  <script src="water.js"></script>
-  <script src="main.js"></script>
+  <script>document.write('<script src="renderer.js?cb=' + _cb + '"><\/script>');</script>
+  <script>document.write('<script src="water.js?cb=' + _cb + '"><\/script>');</script>
+  <script>document.write('<script src="main.js?cb=' + _cb + '"><\/script>');</script>
   <style type="text/css">
     body { font: 13px/140% Arial, sans-serif; background: black; color: white; overflow: hidden; }
     a { color: inherit; cursor: pointer; }
