@@ -78,8 +78,11 @@ window.onload = function() {
       var h = parseFloat(slider.value);     /* tank-widths */
       renderer.poolHeight = h * 2.0;        /* convert to Wallace world units */
       sliderVal.textContent = h.toFixed(2);
-      /* Re-bake the caustic texture against the new depth */
-      if (water && water.textureA) {
+      /* Re-bake the caustic texture against the new depth (only after
+       * a .bin has been loaded; before that, calling updateCaustics
+       * resizes the shared depth renderbuffer to 1024×1024, which then
+       * trips Wallace's canDrawTo check on the 256×256 water textures). */
+      if (water && water.anim) {
         renderer.updateCaustics(water);
         if (paused) draw();
       }
