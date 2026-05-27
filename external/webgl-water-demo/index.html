@@ -28,6 +28,8 @@ Released under the MIT license
     a { color: inherit; cursor: pointer; }
     img { display: none; }
     canvas { position: absolute; top: 0; left: 0; }
+    /* Preview canvas lives inside the floating panel — undo the global rule. */
+    #causticPreview { position: static; top: auto; left: auto; }
     #loading { position: absolute; left: 0; top: 50%; right: 0; text-align: center; margin-top: -8px; z-index: 10; }
 
     /* Collapsible panels (HTML5 <details>) */
