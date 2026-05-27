@@ -82,6 +82,11 @@ Released under the MIT license
       Height scale: <input id="heightScale" type="range" min="0.0" max="10.0" step="0.05" value="1.0">
       <span class="val" id="heightScaleVal">1.00</span>
     </div>
+    <div style="margin-top:8px;" id="timeRow">
+      <button id="playPauseBtn" type="button" style="width:60px;">Pause</button>
+      Time: <input id="timeScrub" type="range" min="0" max="1" step="0.001" value="0" style="width:300px;">
+      <span class="val" id="timeLabel">t = 0.00 / 0.00 s</span>
+    </div>
     <small>Camera: drag to orbit. L key: align light to camera. Space: pause.</small>
   </div>
   <img id="tiles" src="tiles.jpg">

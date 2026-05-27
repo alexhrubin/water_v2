@@ -138,6 +138,19 @@ window.onload = function() {
           var hsVal = document.getElementById('heightScaleVal');
           if (hsSlider) hsSlider.value = heightScale;
           if (hsVal) hsVal.textContent = heightScale.toFixed(2);
+          /* Reset time controls */
+          var ts = document.getElementById('timeScrub');
+          var tl = document.getElementById('timeLabel');
+          if (ts) ts.value = 0;
+          if (tl) {
+            var p = info.period_s > 0 ? info.period_s : 1.0;
+            if (info.nFrames > 1) {
+              tl.textContent = 't = 0.00 / ' + p.toFixed(2) + ' s  (' +
+                               info.nFrames + ' frames)';
+            } else {
+              tl.textContent = '(static — single frame)';
+            }
+          }
           water.playFrame(0, heightScale);
           renderer.updateCaustics(water);
           draw();
@@ -159,6 +172,45 @@ window.onload = function() {
         renderer.updateCaustics(water);
         draw();
       }
+    });
+  }
+
+  /* Play/pause button: mirrors the spacebar handler */
+  var playPauseBtn = document.getElementById('playPauseBtn');
+  function refreshPlayPause() {
+    if (playPauseBtn) playPauseBtn.textContent = paused ? 'Play' : 'Pause';
+  }
+  if (playPauseBtn) {
+    playPauseBtn.addEventListener('click', function() {
+      paused = !paused;
+      refreshPlayPause();
+    });
+  }
+
+  /* Time scrub slider: when the user drags, jump animation time to that
+   * position. When animation plays, the slider position is updated to
+   * reflect current animTime (see update() / draw()). */
+  var timeScrub = document.getElementById('timeScrub');
+  var timeLabel = document.getElementById('timeLabel');
+  var scrubbing = false;
+  if (timeScrub) {
+    timeScrub.addEventListener('input', function() {
+      if (!water.anim || water.anim.nFrames <= 1) return;
+      scrubbing = true;
+      var period = water.anim.period_s > 0 ? water.anim.period_s : 1.0;
+      animTime = parseFloat(timeScrub.value) * period;
+      var idx = Math.floor((animTime / period) * water.anim.nFrames) % water.anim.nFrames;
+      water.anim.idx = idx;
+      water.playFrame(idx, heightScale);
+      renderer.updateCaustics(water);
+      draw();
+      if (timeLabel) {
+        timeLabel.textContent = 't = ' + animTime.toFixed(2) + ' / ' +
+                                period.toFixed(2) + ' s';
+      }
+    });
+    timeScrub.addEventListener('change', function() {
+      scrubbing = false;
     });
   }
 
@@ -282,7 +334,10 @@ window.onload = function() {
   };
 
   document.onkeydown = function(e) {
-    if (e.which == ' '.charCodeAt(0)) paused = !paused;
+    if (e.which == ' '.charCodeAt(0)) {
+      paused = !paused;
+      refreshPlayPause();
+    }
     else if (e.which == 'G'.charCodeAt(0)) useSpherePhysics = !useSpherePhysics;
     else if (e.which == 'L'.charCodeAt(0) && paused) draw();
   };
@@ -297,6 +352,7 @@ window.onload = function() {
      * loaded, do nothing (the water just stays however it was last set). */
     if (!water.anim) return;
     if (water.anim.nFrames <= 1) return;   /* static — already uploaded on load */
+    if (scrubbing) return;                 /* user is dragging the time slider */
 
     animTime += seconds;
     var period = water.anim.period_s > 0 ? water.anim.period_s : 1.0;
@@ -306,6 +362,12 @@ window.onload = function() {
       water.anim.idx = idx;
       water.playFrame(idx, heightScale);
       renderer.updateCaustics(water);
+    }
+    /* Reflect time on the UI */
+    if (timeScrub) timeScrub.value = phase;
+    if (timeLabel) {
+      timeLabel.textContent = 't = ' + (phase * period).toFixed(2) +
+                              ' / ' + period.toFixed(2) + ' s';
     }
   }
 
