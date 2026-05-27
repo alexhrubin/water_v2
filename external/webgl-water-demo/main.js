@@ -48,6 +48,7 @@ window.onload = function() {
   var causticPreviewCtx = causticPreviewCanvas ? causticPreviewCanvas.getContext('2d') : null;
   var causticReadFb = null;       /* reusable framebuffer for texture readback */
   var causticReadBuffer = null;   /* reusable Uint8Array buffer */
+  var causticObservedMax = 0;     /* monotonically-growing max across frames; reset on .bin load */
 
   function onresize() {
     /* Canvas fills the window; collapsible panels float over it. */
@@ -137,22 +138,24 @@ window.onload = function() {
     var h = causticPreviewCanvas.height;
     var img = causticPreviewCtx.createImageData(w, h);
 
-    /* Auto-scale: find the max caustic R-value in the cropped region
-     * so the brightest pixel maps to ~white. Avoids the saturation we
-     * had with a fixed 5× scale (some caustics easily exceed it).
-     * Two-pass over a ~320² preview is cheap. */
-    var maxVal = 1;
+    /* Auto-scale via a monotonically-growing observed max across all
+     * frames seen since the last .bin load. A per-frame max would
+     * pulse on time-varying animations whenever the caustic peak
+     * brightness changed; the growing-max approach converges to the
+     * global max after the first cycle and stays stable thereafter.
+     * Single pass over the cropped preview region. */
+    var frameMax = 1;
     for (var y = 0; y < h; y++) {
       var sy = srcY0 + Math.floor((h - 1 - y) / h * srcHUsed);
       for (var x = 0; x < w; x++) {
         var sx = srcX0 + Math.floor(x / w * srcWUsed);
         var v = causticReadBuffer[(sy * srcW + sx) * 4];
-        if (v > maxVal) maxVal = v;
+        if (v > frameMax) frameMax = v;
       }
     }
-    /* Slight headroom (map to ~240) so genuine peaks still read as bright
-     * but not pure-saturated. */
-    var scale = 240.0 / maxVal;
+    if (frameMax > causticObservedMax) causticObservedMax = frameMax;
+    /* Map observed max to ~240 (headroom so peaks aren't pure-saturated). */
+    var scale = 240.0 / causticObservedMax;
 
     for (var y2 = 0; y2 < h; y2++) {
       /* Flip y because WebGL's framebuffer y-axis is bottom-up */
@@ -209,6 +212,9 @@ window.onload = function() {
                                 info.nx + 'x' + info.ny + ')';
           }
           animTime = 0;
+          /* Reset preview's observed-max so brightness normalization
+           * recalibrates to this new caustic, not the previous one. */
+          causticObservedMax = 0;
           /* Reset height scale to 1.0 so the loaded frame plays at native
            * amplitude (heightScale = 1.0 means raw values from the .bin
            * are uploaded unchanged). */
