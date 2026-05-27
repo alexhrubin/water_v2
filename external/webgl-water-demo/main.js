@@ -68,7 +68,9 @@ window.onload = function() {
 
   /* Live pool-depth slider: value is in TANK-WIDTHS (1.0 = depth equals
    * lateral extent). Wallace's pool spans 2 world units laterally, so
-   * we scale by 2.0 when setting the shader uniform. */
+   * we scale by 2.0 when setting the shader uniform. Re-runs the
+   * caustic shader on every change because poolHeight enters the
+   * caustic projection. */
   var slider = document.getElementById('poolHeight');
   var sliderVal = document.getElementById('poolHeightVal');
   if (slider && sliderVal) {
@@ -76,6 +78,11 @@ window.onload = function() {
       var h = parseFloat(slider.value);     /* tank-widths */
       renderer.poolHeight = h * 2.0;        /* convert to Wallace world units */
       sliderVal.textContent = h.toFixed(2);
+      /* Re-bake the caustic texture against the new depth */
+      if (water && water.textureA) {
+        renderer.updateCaustics(water);
+        if (paused) draw();
+      }
     };
     slider.addEventListener('input', sync);
     sync();

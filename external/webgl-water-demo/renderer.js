@@ -232,11 +232,13 @@ function Renderer() {
     varying vec3 newPos;\
     varying vec3 ray;\
     \
-    /* project the ray onto the plane */\
+    /* project the ray onto the floor plane at y = -poolHeight\
+     * (was hardcoded to y = -1 in the original demo where poolHeight\
+     * was a compile-time constant 1.0) */\
     vec3 project(vec3 origin, vec3 ray, vec3 refractedLight) {\
       vec2 tcube = intersectCube(origin, ray, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));\
       origin += ray * tcube.y;\
-      float tplane = (-origin.y - 1.0) / refractedLight.y;\
+      float tplane = (-origin.y - poolHeight) / refractedLight.y;\
       return origin + refractedLight * tplane;\
     }\
     \
