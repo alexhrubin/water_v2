@@ -30,6 +30,7 @@ var cubemap;
 var renderer;
 var angleX = -25;
 var angleY = -200.5;
+var cameraDistance = 4;   /* wheel-scroll to zoom; updated in window.onload */
 
 // Sphere physics info
 var useSpherePhysics = false;
@@ -393,6 +394,17 @@ window.onload = function() {
     }
   };
 
+  /* Mouse-wheel zoom: scroll to move the camera closer / farther from
+   * the tank. Multiplicative so each tick scales by ~10%, which feels
+   * natural across a wide distance range. Clamped to [1.5, 30]. */
+  document.addEventListener('wheel', function(e) {
+    if (isHelpElement(e.target)) return;   /* let panels scroll normally */
+    e.preventDefault();
+    var factor = Math.exp(e.deltaY * 0.001);
+    cameraDistance = Math.max(1.5, Math.min(30.0, cameraDistance * factor));
+    if (paused) draw();
+  }, { passive: false });
+
   document.onmousemove = function(e) {
     duringDrag(e.pageX, e.pageY);
   };
@@ -467,7 +479,7 @@ window.onload = function() {
 
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.loadIdentity();
-    gl.translate(0, 0, -4);
+    gl.translate(0, 0, -cameraDistance);
     gl.rotate(-angleX, 1, 0, 0);
     gl.rotate(-angleY, 0, 1, 0);
     gl.translate(0, 0.5, 0);
