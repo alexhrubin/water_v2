@@ -27,6 +27,7 @@ from .physics import (
 from .render import (
     reconstruct_surface,
     caustic_image,
+    caustic_image_jacobian,
     snell_landing,
 )
 from .loss import (
@@ -96,7 +97,8 @@ __all__ = [
     "Tank", "Actuator", "Propagator", "build_propagator",
     "transfer_matrix", "steady_state_amplitudes",
     "pack_complex", "unpack_complex",
-    "reconstruct_surface", "caustic_image", "snell_landing",
+    "reconstruct_surface", "caustic_image", "caustic_image_jacobian",
+    "snell_landing",
     "cosine_loss", "pearson_loss", "ssim_loss", "load_target_image",
     "Stage", "make_loss", "optimize_caustic", "surface_validity_report",
     "make_hos_forward",

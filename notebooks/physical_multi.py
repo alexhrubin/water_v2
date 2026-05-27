@@ -26,7 +26,8 @@ import matplotlib.pyplot as plt
 
 from wavetank import (
     Tank, Actuator, build_propagator,
-    steady_state_amplitudes, caustic_image, reconstruct_surface,
+    steady_state_amplitudes, caustic_image, caustic_image_jacobian,
+    reconstruct_surface,
     unpack_complex,
     load_target_image,
     Stage, optimize_caustic, make_hos_forward,
@@ -185,7 +186,8 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
             n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
-            hos_M=None, iters_scale=1.0, surface_tension=0.0):
+            hos_M=None, iters_scale=1.0, surface_tension=0.0,
+            renderer='splat'):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
@@ -215,7 +217,10 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     Xw, Yw = unpack_complex(jnp.asarray(p0), n_act, n_freq)
     Pw = Xw + 1j * Yw
     a_ws = steady_state_amplitudes(prop, Pw, Omega, cfg.t_eval)
-    _, _, I_ws = caustic_image(prop, a_ws, sigma=SIGMA_RENDER, full_snell=FULL_SNELL)
+    if renderer == 'jacobian':
+        _, _, I_ws = caustic_image_jacobian(prop, a_ws, full_snell=FULL_SNELL)
+    else:
+        _, _, I_ws = caustic_image(prop, a_ws, sigma=SIGMA_RENDER, full_snell=FULL_SNELL)
     I_ws = np.asarray(I_ws) / max(np.asarray(I_ws).max(), 1e-9)
     ws_cos = cosine_sim(target, I_ws)
     print(f"  warm-start cos = {ws_cos:.3f}  (throw budget ≈ {25*depth:.0f}mm)", flush=True)
@@ -255,6 +260,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
         p0=p0,
         check_validity=check_validity,
         forward_fn=forward_fn,
+        renderer=renderer,
     )
     elapsed = time.perf_counter() - t0
 
@@ -268,7 +274,10 @@ def run_one(cfg, xs, ys, loss_type='cosine',
             prop, P, Omega, cfg.t_eval)
     else:
         a = steady_state_amplitudes(prop, P, Omega, cfg.t_eval)
-    _, _, I_final = caustic_image(prop, a, sigma=SIGMA_RENDER, full_snell=FULL_SNELL)
+    if renderer == 'jacobian':
+        _, _, I_final = caustic_image_jacobian(prop, a, full_snell=FULL_SNELL)
+    else:
+        _, _, I_final = caustic_image(prop, a, sigma=SIGMA_RENDER, full_snell=FULL_SNELL)
     I_final = np.asarray(I_final)
     I_show = I_final / max(I_final.max(), 1e-9)
     cs = cosine_sim(target, I_show)
@@ -316,7 +325,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
          n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
          freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
          hos_M=None, iters_scale=1.0, targets_filter=None,
-         lambda_override=None, surface_tension=0.0):
+         lambda_override=None, surface_tension=0.0,
+         renderer='splat'):
     if lambda_override is not None:
         lambda_caps = lambda_override
     else:
@@ -337,6 +347,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"its{iters_scale:g}")
     if surface_tension > 0:
         parts.append(f"st{surface_tension:g}")
+    if renderer != 'splat':
+        parts.append(f"r{renderer}")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -378,6 +390,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             freq_max=freq_max, n_freq=n_freq,
             hos_M=hos_M, iters_scale=iters_scale,
             surface_tension=surface_tension,
+            renderer=renderer,
         )
         target  = result['target']
         I_show  = result['I_show']
@@ -472,10 +485,17 @@ if __name__ == "__main__":
                              "For water at 20°C use 7.28e-5. Adds capillary contribution "
                              "to the dispersion ω² = (gk + σ/ρ·k³)·tanh(kd); matters at "
                              "λ ≲ 1.7 cm (shallow / high-mode regimes).")
+    parser.add_argument('--renderer', choices=['splat', 'jacobian'], default='splat',
+                        help="Caustic renderer used inside the optimization loop. "
+                             "'splat' = bilinear-splat + Gaussian blur (default). "
+                             "'jacobian' = Wallace-style anisotropic Gaussian splat "
+                             "with per-source-point covariance from the local "
+                             "Jacobian of the refraction map.")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
          freq_max=args.freq_max, n_freq=args.n_freq,
          hos_M=args.hos_M, iters_scale=args.iters_scale,
          targets_filter=args.targets, lambda_override=args.lambda_slope,
-         surface_tension=args.surface_tension)
+         surface_tension=args.surface_tension,
+         renderer=args.renderer)

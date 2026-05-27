@@ -20,7 +20,7 @@ import optax
 from tqdm import tqdm
 
 from .physics import Propagator, steady_state_amplitudes, unpack_complex
-from .render import caustic_image, reconstruct_surface, _gaussian_blur_separable
+from .render import caustic_image, caustic_image_jacobian, reconstruct_surface, _gaussian_blur_separable
 from .loss import cosine_loss, ssim_loss, pearson_loss
 from .hos import hos_forward, HOSConfig
 
@@ -77,6 +77,7 @@ def make_loss(
     n_water: float = 1.33,
     full_snell: bool = False,
     forward_fn: Callable | None = None,
+    renderer: str = 'splat',
 ) -> callable:
     """
     Build a scalar loss function over the parameter vector params.
@@ -111,6 +112,15 @@ def make_loss(
                     essentially free since they're already computed.
     n_water       : refractive index
     full_snell    : use full Snell's law refraction
+    renderer      : 'splat' (default) uses the bilinear-splat +
+                    Gaussian-blur caustic_image renderer; 'jacobian'
+                    uses caustic_image_jacobian — Wallace-style
+                    anisotropic Gaussian splat with per-source-point
+                    covariance from the local Jacobian of the
+                    refraction map. The two renderers compute the same
+                    intensity field in the continuum limit but differ
+                    in discretization (and thus in optimization
+                    behavior at finite source-grid resolution).
     forward_fn    : function with signature (prop, P, Omega, T) → a that
                     produces modal amplitudes from drive at time T. Defaults
                     to ``steady_state_amplitudes`` (linear theory). Pass an
@@ -172,6 +182,22 @@ def make_loss(
         else:
             raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
+    if renderer == 'splat':
+        def _render(a_):
+            _, _, I_ = caustic_image(prop, a_,
+                                      n_water=n_water, sigma=sigma,
+                                      full_snell=full_snell)
+            return I_
+    elif renderer == 'jacobian':
+        def _render(a_):
+            _, _, I_ = caustic_image_jacobian(prop, a_,
+                                               n_water=n_water,
+                                               full_snell=full_snell)
+            return I_
+    else:
+        raise ValueError(f"Unknown renderer {renderer!r}; expected "
+                         f"'splat' or 'jacobian'")
+
     def loss_fn(params: jnp.ndarray) -> jnp.ndarray:
         X, Y = unpack_complex(params, n_act, n_freq)
         P = X + 1j * Y                                             # [n_act, n_freq]
@@ -179,9 +205,7 @@ def make_loss(
         if movie_mode:
             def per_frame(t):
                 a = fwd(prop, P, Omega, t)
-                _, _, I = caustic_image(prop, a,
-                                        n_water=n_water, sigma=sigma,
-                                        full_snell=full_snell)
+                I = _render(a)
                 eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
                 return (_frame_loss(I),
                         jnp.mean(eta ** 2),
@@ -192,9 +216,7 @@ def make_loss(
             L_slope = jnp.mean(slope_sq_means)
         else:
             a = fwd(prop, P, Omega, T_scalar)
-            _, _, I = caustic_image(prop, a,
-                                    n_water=n_water, sigma=sigma,
-                                    full_snell=full_snell)
+            I = _render(a)
             eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
             L_match = _frame_loss(I)
             L_eta = jnp.mean(eta ** 2)
@@ -232,6 +254,7 @@ def optimize_caustic(
     p0: np.ndarray | None = None,
     check_validity: bool = True,
     forward_fn: Callable | None = None,
+    renderer: str = 'splat',
 ) -> tuple[np.ndarray, list[float]]:
     """
     Optimize actuator phasors to reproduce a target caustic pattern.
@@ -290,7 +313,7 @@ def optimize_caustic(
             loss_type=loss_type, lambda_energy=lambda_energy,
             lambda_eta=lambda_eta, lambda_slope=lambda_slope,
             n_water=n_water, full_snell=full_snell,
-            forward_fn=forward_fn,
+            forward_fn=forward_fn, renderer=renderer,
         )
 
         desc = f"σ={stage.sigma:.3f} [{stage.method}]"

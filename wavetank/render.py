@@ -432,3 +432,219 @@ def caustic_image(
     I      : caustic intensity image [nx, ny] (JAX array)
     """
     return _caustic_image_inner(prop, a, n_water, sigma, cutoff_sigmas, full_snell)
+
+
+# ── Jacobian-based caustic renderer (Wallace-style) ───────────────────
+#
+# Mirrors the per-fragment area-ratio shading from Wallace's WebGL water
+# demo (https://madebyevan.com/webgl-water/, the article describing the
+# technique is https://medium.com/@evanwallace/rendering-realtime-caustics-in-webgl-2a99a29a0b2c).
+#
+# Wallace's algorithm:
+#   1. Vertex shader maps each source-grid vertex to its post-refraction
+#      landing position (x_land, y_land) on the floor. The mesh is then
+#      rasterized in floor-space — triangles are drawn at their deformed
+#      positions on the floor.
+#   2. Fragment shader uses screen-space derivatives (dFdx, dFdy) on the
+#      interpolated source position varying to compute, per floor pixel,
+#      the local Jacobian determinant of the (X_src, Y_src) → (x_land,
+#      y_land) map. Intensity = source_area / floor_area = 1/|det J|.
+#   3. Triangles that fold over on the floor (caustic regions) accumulate
+#      additively via GPU blending — the caustic line emerges naturally
+#      as the sum of overlapping 1/|det J| contributions.
+#
+# This JAX implementation captures the same mathematical content:
+#   1. Compute J per source point via finite differences on the regular
+#      source grid (same numerical character as Wallace's dFdx/dFdy).
+#   2. Build the covariance of the deformed source cell on the floor:
+#      Σ = J · diag(src_dx²/12, src_dy²/12) · J^T
+#      (variance of a uniform-distribution rectangle of size (src_dx,
+#      src_dy) mapped through the local linear approximation J).
+#   3. Splat per source point an anisotropic Gaussian of total mass
+#      src_dx · src_dy at the landing position, with covariance Σ.
+#   4. Floor intensity = sum of splats. Folds and caustic accumulation
+#      emerge from overlapping splats.
+#
+# In the continuum limit this produces the same intensity field as the
+# splat renderer above (both equal 1/|det J| per the change-of-variables
+# theorem). At finite resolution they differ: the J-renderer's per-point
+# Gaussian shape carries the local cell-deformation information, so
+# caustic lines emerge sharply (small Σ → tight Gaussian) and defocus
+# regions are smooth (large Σ → broad Gaussian). The splat renderer
+# uses a fixed-size bilinear point splat that doesn't see the local J.
+
+
+def _aniso_gaussian_splat(
+    x_land: jnp.ndarray,        # [nx, ny] landing x-positions
+    y_land: jnp.ndarray,        # [nx, ny] landing y-positions
+    cov_xx: jnp.ndarray,        # [nx, ny] Σ_xx
+    cov_xy: jnp.ndarray,        # [nx, ny] Σ_xy
+    cov_yy: jnp.ndarray,        # [nx, ny] Σ_yy
+    mass:   jnp.ndarray,        # [nx, ny] total mass per source point
+    xs: jnp.ndarray,            # [nx_floor] floor x-coords
+    ys: jnp.ndarray,            # [ny_floor] floor y-coords
+    kernel_half: int,           # half-width of splat kernel in floor pixels
+) -> jnp.ndarray:
+    """Splat per-source-point anisotropic Gaussians onto a floor grid.
+
+    For each source point (i, j), evaluates the 2-D Gaussian
+        G(p) = (mass/(2π√|Σ|)) · exp(-½ (p-μ)^T Σ^{-1} (p-μ))
+    at a (2K+1)×(2K+1) neighborhood of floor pixels around the landing
+    position, and accumulates the values into the floor grid via
+    scatter-add. JAX-compatible; autodiff flows through the Gaussian
+    weights and the scatter.
+    """
+    nx_floor = xs.shape[0]
+    ny_floor = ys.shape[0]
+    dx_floor = xs[1] - xs[0]
+    dy_floor = ys[1] - ys[0]
+
+    # Nearest floor pixel index per source point
+    ix_base = jnp.clip(
+        jnp.round((x_land - xs[0]) / dx_floor).astype(jnp.int32),
+        0, nx_floor - 1,
+    )                                                     # [nx, ny]
+    iy_base = jnp.clip(
+        jnp.round((y_land - ys[0]) / dy_floor).astype(jnp.int32),
+        0, ny_floor - 1,
+    )                                                     # [nx, ny]
+
+    # Local kernel grid of relative offsets
+    K = 2 * kernel_half + 1
+    offs = jnp.arange(-kernel_half, kernel_half + 1)
+    ox, oy = jnp.meshgrid(offs, offs, indexing='ij')      # [K, K]
+
+    # Absolute pixel indices for each (src, kernel) pair: [nx, ny, K, K]
+    ix = ix_base[..., None, None] + ox[None, None, :, :]
+    iy = iy_base[..., None, None] + oy[None, None, :, :]
+
+    # Pixel center world coords
+    px = xs[0] + ix.astype(x_land.dtype) * dx_floor
+    py = ys[0] + iy.astype(y_land.dtype) * dy_floor
+
+    # Δ from landing position
+    dxp = px - x_land[..., None, None]
+    dyp = py - y_land[..., None, None]
+
+    # Gaussian via Σ^{-1} = (1/|Σ|)·[[Σ_yy, -Σ_xy], [-Σ_xy, Σ_xx]]
+    det_cov = cov_xx * cov_yy - cov_xy * cov_xy           # [nx, ny]
+    det_cov = jnp.maximum(det_cov, 1e-24)                  # safety
+    inv_norm = 1.0 / (2 * jnp.pi * jnp.sqrt(det_cov))      # [nx, ny]
+
+    quadform = (
+        cov_yy[..., None, None] * dxp * dxp
+        - 2.0 * cov_xy[..., None, None] * dxp * dyp
+        + cov_xx[..., None, None] * dyp * dyp
+    ) / det_cov[..., None, None]
+    g = jnp.exp(-0.5 * quadform) * inv_norm[..., None, None]   # [nx, ny, K, K]
+
+    # Each pixel collects (mass · G · pixel_area)
+    contribution = mass[..., None, None] * g * (dx_floor * dy_floor)
+
+    # Mask out-of-bounds pixels (kept index clipped but contribution zeroed)
+    in_bounds = (
+        (ix >= 0) & (ix < nx_floor) &
+        (iy >= 0) & (iy < ny_floor)
+    )
+    contribution = jnp.where(in_bounds, contribution, 0.0)
+    ix = jnp.clip(ix, 0, nx_floor - 1)
+    iy = jnp.clip(iy, 0, ny_floor - 1)
+
+    # Scatter-add: flatten to 1D linear floor index
+    linear_idx = ix * ny_floor + iy                       # [nx, ny, K, K]
+    floor = (
+        jnp.zeros(nx_floor * ny_floor, dtype=contribution.dtype)
+        .at[linear_idx.ravel()]
+        .add(contribution.ravel())
+        .reshape(nx_floor, ny_floor)
+    )
+    return floor
+
+
+def caustic_image_jacobian(
+    prop: Propagator,
+    a: jnp.ndarray,
+    *,
+    n_water: float = 1.33,
+    full_snell: bool = False,
+    kernel_half: int = 4,
+    sigma_floor_pixels: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, jnp.ndarray]:
+    """Jacobian-based caustic renderer mirroring Wallace's GPU shader.
+
+    Parameters
+    ----------
+    prop, a            : as in caustic_image
+    n_water            : refractive index
+    full_snell         : if True, use full vector Snell's law (slower).
+                         The Jacobian is finite-differenced from the same
+                         landing-position grid regardless.
+    kernel_half        : per-source-point splat kernel half-extent in
+                         floor pixels (so kernel is (2K+1)×(2K+1)).
+                         Larger captures more of the Gaussian tail in
+                         defocus regions but costs more compute. Default
+                         4 gives a 9×9 kernel and is sufficient for
+                         typical caustic regimes.
+    sigma_floor_pixels : regularization floor on the splat sigma, in
+                         floor-pixel units. Prevents the caustic
+                         singularity (|det J| → 0) from collapsing the
+                         Gaussian below sub-pixel scale where the
+                         discretized splat loses mass conservation.
+                         Default 0.5 = half a floor pixel.
+
+    Returns
+    -------
+    xs, ys : floor grid coordinates (numpy)
+    I      : caustic intensity image [nx, ny] (JAX array)
+    """
+    xs, ys = prop.xs, prop.ys
+    nx, ny = prop.nx, prop.ny
+    dx_floor = float(xs[1] - xs[0])
+    dy_floor = float(ys[1] - ys[0])
+    throw = prop.tank.throw
+
+    eta, deta_dx, deta_dy = reconstruct_surface(prop, a)
+
+    X_src = jnp.asarray(prop.X_src)
+    Y_src = jnp.asarray(prop.Y_src)
+
+    if full_snell:
+        x_land, y_land = snell_landing(X_src, Y_src, eta, deta_dx, deta_dy,
+                                        throw, n_water)
+    else:
+        x_land, y_land = _paraxial_landing(X_src, Y_src, eta, deta_dx, deta_dy,
+                                            throw, n_water)
+
+    # Jacobian via centered finite differences on the regular source grid
+    # (mirrors Wallace's dFdx/dFdy). Source grid spacing:
+    src_dx = float(prop.tank.Lx / (nx - 1))
+    src_dy = float(prop.tank.Ly / (ny - 1))
+
+    # Centered diffs in interior; one-sided at edges (jnp.gradient handles this)
+    dxl_dXs, dxl_dYs = jnp.gradient(x_land, src_dx, src_dy)
+    dyl_dXs, dyl_dYs = jnp.gradient(y_land, src_dx, src_dy)
+
+    # Deformed-cell covariance: Σ = J · diag(src_dx²/12, src_dy²/12) · J^T
+    s_xx = src_dx * src_dx / 12.0
+    s_yy = src_dy * src_dy / 12.0
+    cov_xx = dxl_dXs * dxl_dXs * s_xx + dxl_dYs * dxl_dYs * s_yy
+    cov_xy = dxl_dXs * dyl_dXs * s_xx + dxl_dYs * dyl_dYs * s_yy
+    cov_yy = dyl_dXs * dyl_dXs * s_xx + dyl_dYs * dyl_dYs * s_yy
+
+    # Regularize: don't let the Gaussian collapse below a sub-pixel floor
+    # (otherwise mass is concentrated in <1 pixel and discretization
+    # loses conservation). Inflate the covariance isotropically:
+    cov_min = (sigma_floor_pixels * max(dx_floor, dy_floor)) ** 2
+    cov_xx = cov_xx + cov_min
+    cov_yy = cov_yy + cov_min
+
+    # Total mass per source point = source-cell area (constant)
+    mass = jnp.full_like(x_land, src_dx * src_dy)
+
+    I = _aniso_gaussian_splat(
+        x_land, y_land, cov_xx, cov_xy, cov_yy, mass,
+        jnp.asarray(xs), jnp.asarray(ys),
+        kernel_half=kernel_half,
+    )
+
+    return xs, ys, I
