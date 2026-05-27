@@ -292,7 +292,24 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     print(f"  peak |η|/depth = {eta_over_d:.3f}  [{eta_status}]    "
           f"peak |∇η| = {peak_slope:.3f}  [{slope_status}]", flush=True)
 
-    return target, I_show, ws_cos, cs, elapsed
+    # Apparatus config — JSON-serializable, sufficient for the export script
+    # in notebooks/export_3d_animation.py to rebuild the apparatus.
+    apparatus_config = dict(
+        Lx=LX, depth=depth, damping=DAMPING,
+        n_modes=n_modes, n_act_per_side=n_act_per_side,
+        actuator_width=0.05,            # built-into Actuator default
+        nx=NX, ny=NY,
+        n_freq=n_freq, freq_min_hz=FREQ_MIN_HZ, freq_max_hz=freq_max,
+        surface_tension=surface_tension,
+        t_eval=cfg.t_eval, hos_M=hos_M,
+    )
+
+    return dict(
+        target=target, I_show=I_show, ws_cos=ws_cos, cs=cs, elapsed=elapsed,
+        params=np.asarray(params), eta=np.asarray(eta_grid),
+        peak_eta=peak_eta, peak_slope=peak_slope,
+        config=apparatus_config,
+    )
 
 
 def main(loss_type='cosine', depth_override=None, no_caps=False,
@@ -354,7 +371,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
 
     summary = []
     for i, cfg in enumerate(targets_to_run):
-        target, I_show, ws_cos, cs, elapsed = run_one(
+        result = run_one(
             cfg, xs, ys, loss_type=loss_type,
             depth_override=depth_override, lambda_caps=lambda_caps,
             n_modes=n_modes, n_act_per_side=n_act_per_side,
@@ -362,7 +379,31 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             hos_M=hos_M, iters_scale=iters_scale,
             surface_tension=surface_tension,
         )
+        target  = result['target']
+        I_show  = result['I_show']
+        ws_cos  = result['ws_cos']
+        cs      = result['cs']
+        elapsed = result['elapsed']
         depth_used = depth_override if depth_override is not None else cfg.depth
+
+        # Save per-target npz so it can be fed into notebooks/export_3d_animation.py.
+        # Includes params (steady-state phasors), config (apparatus dict), and
+        # the final η on the optimization grid.
+        import json
+        npz_path = out_dir / f"{cfg.name}.npz"
+        np.savez(
+            npz_path,
+            target=target,
+            I_show=I_show,
+            eta=result['eta'],
+            params=result['params'],
+            config=json.dumps(result['config']),
+            ws_cos=ws_cos, final_cos=cs,
+            peak_eta=result['peak_eta'],
+            peak_slope=result['peak_slope'],
+            elapsed=elapsed,
+        )
+        print(f"  Saved {npz_path}", flush=True)
 
         # Contrast-stretched view: per-image min-max → [0, 1]. Makes tiny
         # contrast variations visible (relevant for cap-on shallow runs
