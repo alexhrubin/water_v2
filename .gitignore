@@ -22,3 +22,6 @@ example.ipynb
 # Allow target images (needed for inverse-problem eval scripts)
 !targets/*.jpg
 !targets/*.png
+
+# Allow vendored WebGL demo assets (~372K total)
+!external/webgl-water-demo/*.jpg

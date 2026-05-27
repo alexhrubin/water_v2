@@ -222,13 +222,16 @@ def main():
     plt.close(fig)
     print(f"\nSaved: {out_path}")
 
-    # Save raw outputs for inspection
+    # Save raw outputs for inspection. config is JSON-encoded so the
+    # 3D-export script can rebuild the apparatus from this file alone.
+    import json
     np.savez(out_dir / f"{stem}_d{args.depth}.npz",
              target=target, I_ws=np.asarray(I_ws), I_final=I_final_arr,
              eta=np.asarray(eta), params=np.asarray(params),
              ws_cos=ws_cos, final_cos=final_cos,
              slope_peak=slope_peak, eta_peak=eta_peak,
-             contrast_pct=contrast_pct)
+             contrast_pct=contrast_pct,
+             config=json.dumps(vars(args)))
 
 
 if __name__ == "__main__":
