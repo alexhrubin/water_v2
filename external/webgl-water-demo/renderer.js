@@ -108,7 +108,8 @@ function Renderer() {
     wrap: gl.REPEAT,
     format: gl.RGB
   });
-  this.lightDir = new GL.Vector(2.0, 2.0, -1.0).unit();
+  /* Light pointing straight down (Water_v2 viz default — overhead sun). */
+  this.lightDir = new GL.Vector(0.0, 1.0, 0.0);
   this.causticTex = new GL.Texture(1024, 1024);
   this.waterMesh = GL.Mesh.plane({ detail: 200 });
   this.waterShaders = [];

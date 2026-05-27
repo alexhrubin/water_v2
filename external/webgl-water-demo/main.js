@@ -118,32 +118,14 @@ window.onload = function() {
                                 info.nx + 'x' + info.ny + ')';
           }
           animTime = 0;
-          /* If the npz reports a depth, snap the poolHeight slider to it */
-          var slider = document.getElementById('poolHeight');
-          var sliderVal = document.getElementById('poolHeightVal');
-          if (slider && sliderVal && info.depth > 0) {
-            /* Wallace's pool x-extent is 2 (from -1 to 1) in world units.
-             * Our Lx is in meters. To put our depth in his world units
-             * consistently, scale by 2/Lx. */
-            var depthInWorldUnits = info.depth * 2 / info.Lx;
-            depthInWorldUnits = Math.max(parseFloat(slider.min),
-                                         Math.min(parseFloat(slider.max),
-                                                  depthInWorldUnits));
-            slider.value = depthInWorldUnits;
-            renderer.poolHeight = depthInWorldUnits;
-            sliderVal.textContent = depthInWorldUnits.toFixed(2);
-          }
-          /* Auto-scale heights to Wallace's visual range. His drops produce
-           * ~0.01 amplitude. Match that scale by default. */
-          if (info.etaMax > 0) {
-            heightScale = 0.02 / info.etaMax;
-            var hsSlider = document.getElementById('heightScale');
-            var hsVal = document.getElementById('heightScaleVal');
-            if (hsSlider) {
-              hsSlider.value = heightScale;
-              if (hsVal) hsVal.textContent = heightScale.toFixed(2);
-            }
-          }
+          /* Reset height scale to 1.0 so the loaded frame plays at native
+           * amplitude (heightScale = 1.0 means raw values from the .bin
+           * are uploaded unchanged). */
+          heightScale = 1.0;
+          var hsSlider = document.getElementById('heightScale');
+          var hsVal = document.getElementById('heightScaleVal');
+          if (hsSlider) hsSlider.value = heightScale;
+          if (hsVal) hsVal.textContent = heightScale.toFixed(2);
           water.playFrame(0, heightScale);
           renderer.updateCaustics(water);
           draw();
