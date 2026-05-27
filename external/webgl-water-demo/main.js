@@ -136,19 +136,32 @@ window.onload = function() {
     var w = causticPreviewCanvas.width;
     var h = causticPreviewCanvas.height;
     var img = causticPreviewCtx.createImageData(w, h);
-    /* Scale the intensity for visibility. Wallace's shader writes
-     * (oldArea/newArea) * 0.2 into the texture, so multiplying by 5
-     * brings typical caustics to ≈ 1.0. */
-    var INTENSITY_SCALE = 5.0;
+
+    /* Auto-scale: find the max caustic R-value in the cropped region
+     * so the brightest pixel maps to ~white. Avoids the saturation we
+     * had with a fixed 5× scale (some caustics easily exceed it).
+     * Two-pass over a ~320² preview is cheap. */
+    var maxVal = 1;
     for (var y = 0; y < h; y++) {
-      /* Flip y because WebGL's framebuffer y-axis is bottom-up */
       var sy = srcY0 + Math.floor((h - 1 - y) / h * srcHUsed);
       for (var x = 0; x < w; x++) {
         var sx = srcX0 + Math.floor(x / w * srcWUsed);
-        var srcIdx = (sy * srcW + sx) * 4;
-        var val = causticReadBuffer[srcIdx] * INTENSITY_SCALE;
+        var v = causticReadBuffer[(sy * srcW + sx) * 4];
+        if (v > maxVal) maxVal = v;
+      }
+    }
+    /* Slight headroom (map to ~240) so genuine peaks still read as bright
+     * but not pure-saturated. */
+    var scale = 240.0 / maxVal;
+
+    for (var y2 = 0; y2 < h; y2++) {
+      /* Flip y because WebGL's framebuffer y-axis is bottom-up */
+      var sy2 = srcY0 + Math.floor((h - 1 - y2) / h * srcHUsed);
+      for (var x2 = 0; x2 < w; x2++) {
+        var sx2 = srcX0 + Math.floor(x2 / w * srcWUsed);
+        var val = causticReadBuffer[(sy2 * srcW + sx2) * 4] * scale;
         if (val > 255) val = 255;
-        var i = (y * w + x) * 4;
+        var i = (y2 * w + x2) * 4;
         img.data[i]     = val;
         img.data[i + 1] = val;
         img.data[i + 2] = val;
