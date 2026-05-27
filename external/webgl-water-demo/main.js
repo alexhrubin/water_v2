@@ -42,11 +42,16 @@ var paused = false;
 
 window.onload = function() {
   var ratio = window.devicePixelRatio || 1;
-  var help = document.getElementById('help');
   var controls = document.getElementById('controls');
+  var causticView = document.getElementById('causticView');
+  var causticPreviewCanvas = document.getElementById('causticPreview');
+  var causticPreviewCtx = causticPreviewCanvas ? causticPreviewCanvas.getContext('2d') : null;
+  var causticReadFb = null;       /* reusable framebuffer for texture readback */
+  var causticReadBuffer = null;   /* reusable Uint8Array buffer */
 
   function onresize() {
-    var width = innerWidth - help.clientWidth - 20;
+    /* Canvas fills the window; collapsible panels float over it. */
+    var width = innerWidth;
     var height = innerHeight;
     gl.canvas.width = width * ratio;
     gl.canvas.height = height * ratio;
@@ -98,6 +103,67 @@ window.onload = function() {
     zneg: document.getElementById('zneg'),
     zpos: document.getElementById('zpos')
   });
+
+  /* Top-down caustic preview: read renderer.causticTex back via
+   * gl.readPixels, downsample to the 2D preview canvas. Static view —
+   * doesn't rotate with the main scene. Called after every
+   * updateCaustics() so the preview stays in sync. */
+  function updateCausticPreview() {
+    if (!causticPreviewCanvas || !renderer || !renderer.causticTex) return;
+    if (!causticView || !causticView.open) return;   /* skip when collapsed */
+    var srcW = renderer.causticTex.width;
+    var srcH = renderer.causticTex.height;
+    if (!causticReadFb) causticReadFb = gl.createFramebuffer();
+    if (!causticReadBuffer) causticReadBuffer = new Uint8Array(srcW * srcH * 4);
+
+    var prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, causticReadFb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                             gl.TEXTURE_2D, renderer.causticTex.id, 0);
+    gl.readPixels(0, 0, srcW, srcH, gl.RGBA, gl.UNSIGNED_BYTE, causticReadBuffer);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+
+    /* Wallace's caustic texture is laid out with the active pool floor
+     * occupying the central 75% of the texture (the 0.75 factor in the
+     * caustic vertex shader's gl_Position). Crop to that region so the
+     * preview shows just the pool floor. */
+    var crop = 0.125;
+    var srcX0 = Math.floor(srcW * crop);
+    var srcY0 = Math.floor(srcH * crop);
+    var srcWUsed = srcW - 2 * srcX0;
+    var srcHUsed = srcH - 2 * srcY0;
+
+    var w = causticPreviewCanvas.width;
+    var h = causticPreviewCanvas.height;
+    var img = causticPreviewCtx.createImageData(w, h);
+    /* Scale the intensity for visibility. Wallace's shader writes
+     * (oldArea/newArea) * 0.2 into the texture, so multiplying by 5
+     * brings typical caustics to ≈ 1.0. */
+    var INTENSITY_SCALE = 5.0;
+    for (var y = 0; y < h; y++) {
+      /* Flip y because WebGL's framebuffer y-axis is bottom-up */
+      var sy = srcY0 + Math.floor((h - 1 - y) / h * srcHUsed);
+      for (var x = 0; x < w; x++) {
+        var sx = srcX0 + Math.floor(x / w * srcWUsed);
+        var srcIdx = (sy * srcW + sx) * 4;
+        var val = causticReadBuffer[srcIdx] * INTENSITY_SCALE;
+        if (val > 255) val = 255;
+        var i = (y * w + x) * 4;
+        img.data[i]     = val;
+        img.data[i + 1] = val;
+        img.data[i + 2] = val;
+        img.data[i + 3] = 255;
+      }
+    }
+    causticPreviewCtx.putImageData(img, 0, 0);
+  }
+
+  /* Refresh preview when the user opens the panel (it might be stale) */
+  if (causticView) {
+    causticView.addEventListener('toggle', function() {
+      if (causticView.open) updateCausticPreview();
+    });
+  }
 
   if (!water.textureA.canDrawTo() || !water.textureB.canDrawTo()) {
     throw new Error('Rendering to floating-point textures is required but not supported');
@@ -295,7 +361,9 @@ window.onload = function() {
   }
 
   function isHelpElement(element) {
-    return element === help || element === controls
+    /* Any element inside the controls or caustic-view panels is exempted
+     * from the camera-drag handler so the controls themselves work. */
+    return element === controls || element === causticView
         || element.parentNode && isHelpElement(element.parentNode);
   }
 
@@ -392,5 +460,10 @@ window.onload = function() {
     renderer.renderWater(water, cubemap);
     if (radius > 0) renderer.renderSphere();
     gl.disable(gl.DEPTH_TEST);
+
+    /* Top-down caustic preview, drawn AFTER the main 3D scene so the
+     * readPixels uses the freshly-baked causticTex. The function
+     * early-returns when the panel is collapsed. */
+    updateCausticPreview();
   }
 };
