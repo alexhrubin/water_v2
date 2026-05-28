@@ -156,17 +156,17 @@ TARGETS = [
 
 def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
                 freq_max=FREQ_MAX_HZ, n_freq=N_FREQ, surface_tension=0.0,
-                nx=NX, ny=NY):
+                nx=NX, ny=NY, actuator_width=0.05):
     tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING,
                 surface_tension=surface_tension)
     acts = []
     for i in range(n_act_per_side):
         t = (i + 1) / (n_act_per_side + 1)
         acts += [
-            Actuator(x=0.0,        y=t * LY),
-            Actuator(x=LX,         y=t * LY),
-            Actuator(x=t * LX,     y=0.0),
-            Actuator(x=t * LX,     y=LY),
+            Actuator(x=0.0,        y=t * LY,    width=actuator_width),
+            Actuator(x=LX,         y=t * LY,    width=actuator_width),
+            Actuator(x=t * LX,     y=0.0,       width=actuator_width),
+            Actuator(x=t * LX,     y=LY,        width=actuator_width),
         ]
     prop  = build_propagator(tank, acts, n_modes=n_modes, nx=nx, ny=ny)
     Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(FREQ_MIN_HZ, freq_max, n_freq)])
@@ -188,7 +188,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
             n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
             hos_M=None, iters_scale=1.0, surface_tension=0.0,
-            renderer='splat', nx=NX, ny=NY):
+            renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
@@ -200,7 +200,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     prop, Omega = build_setup(depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
                               freq_max=freq_max, n_freq=n_freq,
                               surface_tension=surface_tension,
-                              nx=nx, ny=ny)
+                              nx=nx, ny=ny, actuator_width=actuator_width)
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
@@ -308,7 +308,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     apparatus_config = dict(
         Lx=LX, depth=depth, damping=DAMPING,
         n_modes=n_modes, n_act_per_side=n_act_per_side,
-        actuator_width=0.05,            # built-into Actuator default
+        actuator_width=actuator_width,  # configurable (default 0.05m = 5cm)
         nx=nx, ny=ny,
         n_freq=n_freq, freq_min_hz=FREQ_MIN_HZ, freq_max_hz=freq_max,
         surface_tension=surface_tension,
@@ -328,7 +328,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
          freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
          hos_M=None, iters_scale=1.0, targets_filter=None,
          lambda_override=None, surface_tension=0.0,
-         renderer='splat', nx=NX, ny=NY):
+         renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
     if lambda_override is not None:
         lambda_caps = lambda_override
     else:
@@ -353,6 +353,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"r{renderer}")
     if nx != NX or ny != NY:
         parts.append(f"g{nx}x{ny}")
+    if actuator_width != 0.05:
+        parts.append(f"σ{int(round(actuator_width*1000))}mm")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -396,6 +398,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             surface_tension=surface_tension,
             renderer=renderer,
             nx=nx, ny=ny,
+            actuator_width=actuator_width,
         )
         target  = result['target']
         I_show  = result['I_show']
@@ -503,6 +506,12 @@ if __name__ == "__main__":
                              "at O(nx²) optimization cost.")
     parser.add_argument('--ny', type=int, default=NY,
                         help=f"Source/floor grid y-resolution (default {NY}).")
+    parser.add_argument('--actuator_width', type=float, default=0.05,
+                        help="Gaussian half-width σ (m) of each actuator's spatial "
+                             "footprint (default 0.05 = 5 cm). Couples to mode (m,n) "
+                             "as exp(-σ²·k²/2), so larger σ suppresses higher-k modes. "
+                             "Use ~0.005 (5 mm) when probing high-k modes (e.g., shallow-"
+                             "tank diagnostics).")
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
@@ -511,4 +520,5 @@ if __name__ == "__main__":
          targets_filter=args.targets, lambda_override=args.lambda_slope,
          surface_tension=args.surface_tension,
          renderer=args.renderer,
-         nx=args.nx, ny=args.ny)
+         nx=args.nx, ny=args.ny,
+         actuator_width=args.actuator_width)
