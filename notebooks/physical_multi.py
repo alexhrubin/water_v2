@@ -41,9 +41,23 @@ NX, NY         = 200, 200
 N_ACT_PER_SIDE = 12
 N_MODES        = 15
 N_FREQ         = 24
-FREQ_MIN_HZ    = 0.5
-FREQ_MAX_HZ    = 5.0
 SIGMA_RENDER   = 0.005
+
+
+def useful_freq_band_hz(depth, actuator_width, s_max=0.1, g=9.81):
+    """Apparatus's natural drive frequency band.
+
+    Lower bound from the focal-threshold mode (smallest k that can form
+    caustics within the slope cap): k_min = 4/(s_max·d).
+    Upper bound from the actuator-footprint cutoff (largest k an
+    actuator with Gaussian half-width σ can couple to): k_max ≈ 1/σ.
+    Each k maps to its Airy resonant frequency via ω² = g·k·tanh(k·d).
+    """
+    k_min = 4.0 / (s_max * depth)
+    k_max = 1.0 / actuator_width
+    omega_min = (g * k_min * np.tanh(k_min * depth)) ** 0.5
+    omega_max = (g * k_max * np.tanh(k_max * depth)) ** 0.5
+    return omega_min / (2 * np.pi), omega_max / (2 * np.pi)
 
 # Cap enforcement + optimizer settings (deep_pool-style)
 LAMBDA_ETA     = 100.0
@@ -155,8 +169,10 @@ TARGETS = [
 
 
 def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
-                freq_max=FREQ_MAX_HZ, n_freq=N_FREQ, surface_tension=0.0,
+                freq_min=None, freq_max=None, n_freq=N_FREQ, surface_tension=0.0,
                 nx=NX, ny=NY, actuator_width=0.05):
+    """Build propagator + driving Omega. If freq_min/freq_max are None,
+    they're computed from the apparatus's natural useful band."""
     tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING,
                 surface_tension=surface_tension)
     acts = []
@@ -169,8 +185,14 @@ def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
             Actuator(x=t * LX,     y=LY,        width=actuator_width),
         ]
     prop  = build_propagator(tank, acts, n_modes=n_modes, nx=nx, ny=ny)
-    Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(FREQ_MIN_HZ, freq_max, n_freq)])
-    return prop, Omega
+    if freq_min is None or freq_max is None:
+        f_lo_auto, f_hi_auto = useful_freq_band_hz(depth, actuator_width)
+        if freq_min is None:
+            freq_min = f_lo_auto
+        if freq_max is None:
+            freq_max = f_hi_auto
+    Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(freq_min, freq_max, n_freq)])
+    return prop, Omega, float(freq_min), float(freq_max)
 
 
 def cosine_sim(a, b):
@@ -186,21 +208,28 @@ def temporal_window(t_eval, n_temporal, sigma_temporal):
 
 def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
-            n_act_per_side=N_ACT_PER_SIDE, freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
-            hos_M=None, iters_scale=1.0, surface_tension=0.0,
+            n_act_per_side=N_ACT_PER_SIDE, freq_min=None, freq_max=None,
+            n_freq=N_FREQ, hos_M=None, iters_scale=1.0, surface_tension=0.0,
             renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
     st_label = f", σ/ρ={surface_tension:g}" if surface_tension > 0 else ""
+    # Resolve freq band so we can print it accurately (and pass concrete
+    # values down to build_setup + save into apparatus_config).
+    f_lo_auto, f_hi_auto = useful_freq_band_hz(depth, actuator_width)
+    fmin = freq_min if freq_min is not None else f_lo_auto
+    fmax = freq_max if freq_max is not None else f_hi_auto
     print(f"\n{'='*60}\n  Target: {cfg.name} (depth={depth}m, modes={n_modes}², "
-          f"act={n_act_per_side}/side, freq=[{FREQ_MIN_HZ}-{freq_max}Hz]×{n_freq}, "
+          f"act={n_act_per_side}/side, freq=[{fmin:.2f}-{fmax:.2f}Hz]×{n_freq}, "
           f"loss={loss_type}, caps={caps_str}, forward={forward_label}{st_label})\n{'='*60}",
           flush=True)
-    prop, Omega = build_setup(depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
-                              freq_max=freq_max, n_freq=n_freq,
-                              surface_tension=surface_tension,
-                              nx=nx, ny=ny, actuator_width=actuator_width)
+    prop, Omega, fmin, fmax = build_setup(
+        depth, n_modes=n_modes, n_act_per_side=n_act_per_side,
+        freq_min=fmin, freq_max=fmax, n_freq=n_freq,
+        surface_tension=surface_tension,
+        nx=nx, ny=ny, actuator_width=actuator_width,
+    )
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
 
@@ -310,7 +339,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
         n_modes=n_modes, n_act_per_side=n_act_per_side,
         actuator_width=actuator_width,  # configurable (default 0.05m = 5cm)
         nx=nx, ny=ny,
-        n_freq=n_freq, freq_min_hz=FREQ_MIN_HZ, freq_max_hz=freq_max,
+        n_freq=n_freq, freq_min_hz=fmin, freq_max_hz=fmax,
         surface_tension=surface_tension,
         t_eval=cfg.t_eval, hos_M=hos_M,
     )
@@ -325,7 +354,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
 
 def main(loss_type='cosine', depth_override=None, no_caps=False,
          n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
-         freq_max=FREQ_MAX_HZ, n_freq=N_FREQ,
+         freq_min=None, freq_max=None, n_freq=N_FREQ,
          hos_M=None, iters_scale=1.0, targets_filter=None,
          lambda_override=None, surface_tension=0.0,
          renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
@@ -341,8 +370,12 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"m{n_modes}")
     if n_act_per_side != N_ACT_PER_SIDE:
         parts.append(f"a{n_act_per_side}")
-    if freq_max != FREQ_MAX_HZ or n_freq != N_FREQ:
-        parts.append(f"f{freq_max:g}x{n_freq}")
+    # Tag the freq band only when explicitly overridden (otherwise it's
+    # auto-derived from depth + actuator_width, which are already tagged).
+    if freq_min is not None or freq_max is not None or n_freq != N_FREQ:
+        fmin_tag = f"{freq_min:g}" if freq_min is not None else "auto"
+        fmax_tag = f"{freq_max:g}" if freq_max is not None else "auto"
+        parts.append(f"f{fmin_tag}-{fmax_tag}x{n_freq}")
     if hos_M is not None:
         parts.append(f"hosM{hos_M}")
     if iters_scale != 1.0:
@@ -360,8 +393,13 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"JAX {jax.__version__} on {jax.default_backend()}", flush=True)
+    if freq_min is None and freq_max is None:
+        freq_label = "auto (from depth+actuator)"
+    else:
+        freq_label = (f"[{freq_min if freq_min is not None else 'auto'}"
+                       f"–{freq_max if freq_max is not None else 'auto'} Hz]")
     print(f"Apparatus: actuators={4 * n_act_per_side} ({n_act_per_side}/side), "
-          f"freqs={n_freq} [{FREQ_MIN_HZ}-{freq_max}Hz], "
+          f"freqs={n_freq} {freq_label}, "
           f"modes={n_modes}², grid={nx}×{ny}")
     print(f"Phasor DOFs: {2 * 4 * n_act_per_side * n_freq}")
     print(f"Optimizer: L-BFGS, full Snell, "
@@ -393,7 +431,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             cfg, xs, ys, loss_type=loss_type,
             depth_override=depth_override, lambda_caps=lambda_caps,
             n_modes=n_modes, n_act_per_side=n_act_per_side,
-            freq_max=freq_max, n_freq=n_freq,
+            freq_min=freq_min, freq_max=freq_max, n_freq=n_freq,
             hos_M=hos_M, iters_scale=iters_scale,
             surface_tension=surface_tension,
             renderer=renderer,
@@ -470,9 +508,15 @@ if __name__ == "__main__":
     parser.add_argument('--n_act_per_side', type=int, default=N_ACT_PER_SIDE,
                         help=f"Actuators per side (default {N_ACT_PER_SIDE}). "
                              "Raises rank of actuator coupling matrix.")
-    parser.add_argument('--freq_max', type=float, default=FREQ_MAX_HZ,
-                        help=f"Max driving frequency Hz (default {FREQ_MAX_HZ}). "
-                             "Higher freqs resonantly excite higher-k modes.")
+    parser.add_argument('--freq_min', type=float, default=None,
+                        help="Min driving frequency Hz. Default: auto-derived "
+                             "from the focal-threshold mode for the apparatus's "
+                             "(depth, slope_cap=0.1) — the lower edge of the "
+                             "useful caustic-forming band.")
+    parser.add_argument('--freq_max', type=float, default=None,
+                        help="Max driving frequency Hz. Default: auto-derived "
+                             "from the actuator-footprint cutoff k_max≈1/σ — "
+                             "the upper edge of the useful actuator-coupled band.")
     parser.add_argument('--n_freq', type=int, default=N_FREQ,
                         help=f"Number of driving frequencies (default {N_FREQ}).")
     parser.add_argument('--hos_M', type=int, default=None, choices=[1, 2],
@@ -515,7 +559,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
-         freq_max=args.freq_max, n_freq=args.n_freq,
+         freq_min=args.freq_min, freq_max=args.freq_max, n_freq=args.n_freq,
          hos_M=args.hos_M, iters_scale=args.iters_scale,
          targets_filter=args.targets, lambda_override=args.lambda_slope,
          surface_tension=args.surface_tension,
