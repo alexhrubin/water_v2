@@ -199,13 +199,28 @@ Water.prototype.loadAnimation = function(arrayBuffer) {
   };
   var dataStart = 32;
   var frameSize = this.anim.nx * this.anim.ny;
+  var heightsBytes = this.anim.nFrames * frameSize * 4;
   this.anim.frames = new Float32Array(arrayBuffer, dataStart,
                                        this.anim.nFrames * frameSize);
+  /* Optional: 2 extra Float32 channels per voxel appended after the heights
+   * block carry analytical normals (info.b, info.a) computed at export time
+   * from the cos basis. If present, playFrame uploads them directly and
+   * skips normalShader, avoiding the 4-neighbor finite-diff low-pass that
+   * Wallace's stencil would otherwise apply to our surface gradients. */
+  var normalsBytes = this.anim.nFrames * frameSize * 8;   /* 2 floats */
+  if (arrayBuffer.byteLength >= dataStart + heightsBytes + normalsBytes) {
+    this.anim.normals = new Float32Array(arrayBuffer,
+                                          dataStart + heightsBytes,
+                                          this.anim.nFrames * frameSize * 2);
+  } else {
+    this.anim.normals = null;
+  }
   this.anim.idx = 0;
   console.log('Loaded animation:', this.anim.nFrames, 'frames at',
               this.anim.nx + 'x' + this.anim.ny,
               'Lx=' + this.anim.Lx + 'm  depth=' + this.anim.depth + 'm  |η|_max=' +
-              this.anim.etaMax.toExponential(3) + 'm');
+              this.anim.etaMax.toExponential(3) + 'm  normals=' +
+              (this.anim.normals ? 'yes (analytical)' : 'no (Wallace FD)'));
   return this.anim;
 };
 
@@ -226,10 +241,29 @@ Water.prototype.playFrame = function(frameIdx, scale) {
   }
   var frame = this.anim.frames.subarray(frameIdx * nx * ny,
                                          (frameIdx + 1) * nx * ny);
-  /* Build RGBA float buffer: r = η * scale, g = 0, b/a = 0 (normals filled by shader) */
+  /* Build RGBA float buffer: r = η * scale, g = 0, b/a = normals (or 0).
+   * If analytical normals are present in the .bin, write them directly
+   * into b/a and skip the updateNormals() shader pass below. Otherwise
+   * leave b/a = 0 and run normalShader (Wallace's 4-neighbor FD). */
   var rgba = new Float32Array(nx * ny * 4);
-  for (var i = 0; i < nx * ny; i++) {
-    rgba[i * 4] = frame[i] * scale;
+  var hasNormals = !!this.anim.normals;
+  if (hasNormals) {
+    /* Normals are unit vectors (independent of height-scale), so we
+     * don't multiply by scale. NOTE: this means analytical normals are
+     * only physically consistent at scale=1.0; for diagnostic comparison
+     * against our optimization keep the slider at 1.0. */
+    var nview = this.anim.normals.subarray(frameIdx * nx * ny * 2,
+                                             (frameIdx + 1) * nx * ny * 2);
+    for (var i = 0; i < nx * ny; i++) {
+      rgba[i * 4]     = frame[i] * scale;
+      /* g (velocity) stays 0 — only meaningful for live simulation */
+      rgba[i * 4 + 2] = nview[i * 2];        /* info.b = n_x  (unscaled) */
+      rgba[i * 4 + 3] = nview[i * 2 + 1];    /* info.a = n_z  (unscaled) */
+    }
+  } else {
+    for (var i = 0; i < nx * ny; i++) {
+      rgba[i * 4] = frame[i] * scale;
+    }
   }
   this.textureA.bind();
   /* Match the texture's actual type — Wallace falls back to HALF_FLOAT_OES
@@ -260,5 +294,11 @@ Water.prototype.playFrame = function(frameIdx, scale) {
     throw new Error('Unsupported texture type for animation upload: 0x' +
                     this.textureA.type.toString(16));
   }
-  this.updateNormals();
+  /* Only run the 4-neighbor FD normalShader when we don't have
+   * analytical normals from the exporter. With analytical normals,
+   * info.b and info.a were just written directly above and would be
+   * overwritten if we ran the shader. */
+  if (!hasNormals) {
+    this.updateNormals();
+  }
 };
