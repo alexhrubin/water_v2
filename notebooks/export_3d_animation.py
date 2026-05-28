@@ -133,15 +133,27 @@ def render_animation_from_params(cfg, prop, params, Omega_freqs, period_s,
         eta, deta_dx, deta_dy = reconstruct_surface(render_prop, a)
         frames[i] = np.asarray(eta).astype(np.float32)
         if with_normals:
-            # Convert slopes from our (meters) coords to Wallace's world
-            # coords (pool spans 2 units laterally, so dx_wallace =
-            # 2/Lx · dx_meters → slope_wallace = slope_meters · Lx/2).
-            slope_x_w = np.asarray(deta_dx) * (Lx / 2)
-            slope_y_w = np.asarray(deta_dy) * (Lx / 2)
-            norm = np.sqrt(1.0 + slope_x_w**2 + slope_y_w**2)
-            # info.b = n_x, info.a = n_z (Wallace's channel convention)
-            normals[i, ..., 0] = (-slope_x_w / norm).astype(np.float32)
-            normals[i, ..., 1] = (-slope_y_w / norm).astype(np.float32)
+            # Match what Wallace's normalShader would have stored, NOT
+            # the true world-coord unit normal. His shader's dx/dy
+            # vectors use tex-coord steps (1/256) for the spatial axes
+            # but world-units for the height axis — mixed units. Working
+            # through the cross product for our η in meters with our
+            # lateral extent Lx (so one tex unit = Lx meters):
+            #
+            #   ∂h/∂tex_x = slope_meters · Lx   (call this α)
+            #   info.b   = -α / sqrt(1 + α² + α_y²)
+            #
+            # Then in the caustic shader, info.ba *= 0.5 is applied
+            # before the normal is reconstructed — that brings the
+            # effective slope into world coords, where refraction
+            # behaves correctly. If we uploaded world-coord normals
+            # directly (slope · Lx/2), the *= 0.5 would halve them
+            # again and the caustic would essentially vanish.
+            slope_x_tex = np.asarray(deta_dx) * Lx
+            slope_y_tex = np.asarray(deta_dy) * Lx
+            norm = np.sqrt(1.0 + slope_x_tex**2 + slope_y_tex**2)
+            normals[i, ..., 0] = (-slope_x_tex / norm).astype(np.float32)
+            normals[i, ..., 1] = (-slope_y_tex / norm).astype(np.float32)
         if i % 10 == 0 or i == n_frames - 1:
             slope_peak = float(np.max(np.sqrt(
                 np.asarray(deta_dx)**2 + np.asarray(deta_dy)**2)))
