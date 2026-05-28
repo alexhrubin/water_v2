@@ -133,27 +133,33 @@ def render_animation_from_params(cfg, prop, params, Omega_freqs, period_s,
         eta, deta_dx, deta_dy = reconstruct_surface(render_prop, a)
         frames[i] = np.asarray(eta).astype(np.float32)
         if with_normals:
-            # Match what Wallace's normalShader would have stored, NOT
-            # the true world-coord unit normal. His shader's dx/dy
-            # vectors use tex-coord steps (1/256) for the spatial axes
-            # but world-units for the height axis — mixed units. Working
-            # through the cross product for our η in meters with our
-            # lateral extent Lx (so one tex unit = Lx meters):
+            # Match what Wallace's normalShader would have computed
+            # from the η field we just uploaded — including the x/y
+            # transpose that happens during the .tobytes() → texture
+            # roundtrip.
             #
-            #   ∂h/∂tex_x = slope_meters · Lx   (call this α)
-            #   info.b   = -α / sqrt(1 + α² + α_y²)
+            # In our array, eta[i_x, i_y] (with i_y fastest in
+            # row-major). texSubImage2D interprets the buffer with
+            # tex_x as the fast axis, so our i_y becomes Wallace's
+            # tex_x and our i_x becomes Wallace's tex_y. Wallace's
+            # normalShader then computes dh/dtex_x along our y-axis
+            # (→ his info.b channel = our y-gradient direction) and
+            # dh/dtex_y along our x-axis (→ his info.a channel = our
+            # x-gradient direction).
             #
-            # Then in the caustic shader, info.ba *= 0.5 is applied
-            # before the normal is reconstructed — that brings the
-            # effective slope into world coords, where refraction
-            # behaves correctly. If we uploaded world-coord normals
-            # directly (slope · Lx/2), the *= 0.5 would halve them
-            # again and the caustic would essentially vanish.
-            slope_x_tex = np.asarray(deta_dx) * Lx
-            slope_y_tex = np.asarray(deta_dy) * Lx
-            norm = np.sqrt(1.0 + slope_x_tex**2 + slope_y_tex**2)
-            normals[i, ..., 0] = (-slope_x_tex / norm).astype(np.float32)
-            normals[i, ..., 1] = (-slope_y_tex / norm).astype(np.float32)
+            # His shader stores -dh_per_tex_step / sqrt(1 + Σdh²)
+            # where dh_per_tex_step = ∂h/∂tex_axis × (tex step). For
+            # one tex unit spanning our full Ly (resp. Lx), this works
+            # out to -∂η/∂y_ours × Ly (resp. -∂η/∂x_ours × Lx) for the
+            # numerator. Then in the caustic shader his `info.ba *= 0.5`
+            # brings it into world coordinates.
+            sx_norm = np.asarray(deta_dx) * Lx       # our x-grad in tex units
+            sy_norm = np.asarray(deta_dy) * Lx       # our y-grad in tex units (assumes Ly=Lx)
+            norm = np.sqrt(1.0 + sx_norm**2 + sy_norm**2)
+            # info.b channel (Wallace's x-component) ← our y-gradient
+            normals[i, ..., 0] = (-sy_norm / norm).astype(np.float32)
+            # info.a channel (Wallace's z-component) ← our x-gradient
+            normals[i, ..., 1] = (-sx_norm / norm).astype(np.float32)
         if i % 10 == 0 or i == n_frames - 1:
             slope_peak = float(np.max(np.sqrt(
                 np.asarray(deta_dx)**2 + np.asarray(deta_dy)**2)))
