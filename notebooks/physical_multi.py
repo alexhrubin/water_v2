@@ -225,8 +225,12 @@ def run_one(cfg, xs, ys, loss_type='cosine',
             n_act_per_side=N_ACT_PER_SIDE, freq_min=None, freq_max=None,
             n_freq=N_FREQ, hos_M=None, iters_scale=1.0, surface_tension=0.0,
             renderer='splat', nx=NX, ny=NY, actuator_width=0.05,
-            Lx=LX, Ly=LY):
+            Lx=LX, Ly=LY, time_width=None, n_temporal=None):
     depth = depth_override if depth_override is not None else cfg.depth
+    # Time-window overrides: --time_width W is the full window width, so
+    # sigma_temporal = W/2 (matches temporal_window's [-sigma, +sigma] sample range).
+    eff_sigma_temporal = (time_width / 2.0) if time_width is not None else cfg.sigma_temporal
+    eff_n_temporal = n_temporal if n_temporal is not None else cfg.n_temporal
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
     st_label = f", σ/ρ={surface_tension:g}" if surface_tension > 0 else ""
@@ -251,12 +255,16 @@ def run_one(cfg, xs, ys, loss_type='cosine',
 
     # HOS forward only supports scalar T_eval (no multi-frame averaging).
     # Fall back to single-frame when HOS is on.
-    if hos_M is not None and cfg.n_temporal > 1:
+    if hos_M is not None and eff_n_temporal > 1:
         T_array = cfg.t_eval
-        print(f"  HOS mode: dropping temporal window (n={cfg.n_temporal}), "
+        print(f"  HOS mode: dropping temporal window (n={eff_n_temporal}), "
               f"using scalar T_eval={cfg.t_eval}", flush=True)
     else:
-        T_array = temporal_window(cfg.t_eval, cfg.n_temporal, cfg.sigma_temporal)
+        T_array = temporal_window(cfg.t_eval, eff_n_temporal, eff_sigma_temporal)
+        if eff_n_temporal > 1:
+            print(f"  Temporal window: n={eff_n_temporal} samples in "
+                  f"t_eval ± {eff_sigma_temporal:.4f}s "
+                  f"(full width {2*eff_sigma_temporal:.4f}s)", flush=True)
 
     # Warm-start
     ana = analytical_solve(prop, target, np.asarray(Omega), cfg.t_eval)
@@ -374,7 +382,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
          hos_M=None, iters_scale=1.0, targets_filter=None,
          lambda_override=None, surface_tension=0.0,
          renderer='splat', nx=NX, ny=NY, actuator_width=0.05,
-         Lx=LX, Ly=LY):
+         Lx=LX, Ly=LY, time_width=None, n_temporal=None):
     if lambda_override is not None:
         lambda_caps = lambda_override
     else:
@@ -410,6 +418,10 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             parts.append(f"L{Lx:g}m")
         else:
             parts.append(f"Lx{Lx:g}_Ly{Ly:g}m")
+    if time_width is not None:
+        parts.append(f"tw{time_width:g}")
+    if n_temporal is not None:
+        parts.append(f"nt{n_temporal}")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -460,6 +472,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             nx=nx, ny=ny,
             actuator_width=actuator_width,
             Lx=Lx, Ly=Ly,
+            time_width=time_width, n_temporal=n_temporal,
         )
         target  = result['target']
         I_show  = result['I_show']
@@ -589,6 +602,16 @@ if __name__ == "__main__":
     parser.add_argument('--L', type=float, default=None,
                         help="Shorthand: set both --Lx and --Ly to the same value. "
                              "Overrides --Lx/--Ly if specified.")
+    parser.add_argument('--time_width', type=float, default=None,
+                        help="Full width [s] of the temporal averaging window "
+                             "around each target's t_eval (the loss is averaged "
+                             "over n_temporal samples in [t_eval-W/2, t_eval+W/2]). "
+                             "Overrides each target's per-config sigma_temporal "
+                             "(default window for image targets is 0.066 s).")
+    parser.add_argument('--n_temporal', type=int, default=None,
+                        help="Number of samples in the temporal window "
+                             "(overrides each target's per-config n_temporal, "
+                             "default 5 for image targets, 1 for sine_wave).")
     args = parser.parse_args()
     # --L shorthand overrides --Lx/--Ly
     if args.L is not None:
@@ -603,4 +626,5 @@ if __name__ == "__main__":
          renderer=args.renderer,
          nx=args.nx, ny=args.ny,
          actuator_width=args.actuator_width,
-         Lx=args.Lx, Ly=args.Ly)
+         Lx=args.Lx, Ly=args.Ly,
+         time_width=args.time_width, n_temporal=args.n_temporal)
