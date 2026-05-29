@@ -170,19 +170,19 @@ TARGETS = [
 
 def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
                 freq_min=None, freq_max=None, n_freq=N_FREQ, surface_tension=0.0,
-                nx=NX, ny=NY, actuator_width=0.05):
+                nx=NX, ny=NY, actuator_width=0.05, Lx=LX, Ly=LY):
     """Build propagator + driving Omega. If freq_min/freq_max are None,
     they're computed from the apparatus's natural useful band."""
-    tank = Tank(Lx=LX, Ly=LY, depth=depth, damping=DAMPING,
+    tank = Tank(Lx=Lx, Ly=Ly, depth=depth, damping=DAMPING,
                 surface_tension=surface_tension)
     acts = []
     for i in range(n_act_per_side):
         t = (i + 1) / (n_act_per_side + 1)
         acts += [
-            Actuator(x=0.0,        y=t * LY,    width=actuator_width),
-            Actuator(x=LX,         y=t * LY,    width=actuator_width),
-            Actuator(x=t * LX,     y=0.0,       width=actuator_width),
-            Actuator(x=t * LX,     y=LY,        width=actuator_width),
+            Actuator(x=0.0,        y=t * Ly,    width=actuator_width),
+            Actuator(x=Lx,         y=t * Ly,    width=actuator_width),
+            Actuator(x=t * Lx,     y=0.0,       width=actuator_width),
+            Actuator(x=t * Lx,     y=Ly,        width=actuator_width),
         ]
     prop  = build_propagator(tank, acts, n_modes=n_modes, nx=nx, ny=ny)
     if freq_min is None or freq_max is None:
@@ -191,6 +191,20 @@ def build_setup(depth, n_modes=N_MODES, n_act_per_side=N_ACT_PER_SIDE,
             freq_min = f_lo_auto
         if freq_max is None:
             freq_max = f_hi_auto
+        # Empty band → the focal-threshold mode is past the actuator-footprint
+        # cutoff (apparatus geometry can't supply caustic-forming modes that
+        # actuators can also drive). Equivalent to d < 40·σ for water at
+        # s_max=0.1. Warn loudly; the run can still proceed but won't form
+        # honest caustics.
+        if f_lo_auto > f_hi_auto:
+            print(
+                f"  WARNING: useful freq band is empty for d={depth}m, "
+                f"σ={actuator_width}m: focal-threshold f_min ({f_lo_auto:.2f} Hz) "
+                f"> actuator-cutoff f_max ({f_hi_auto:.2f} Hz). "
+                f"Required: d > 40·σ (water, s_max=0.1) — here d/σ = "
+                f"{depth/actuator_width:.1f} < 40.",
+                flush=True,
+            )
     Omega = jnp.asarray([2 * np.pi * f for f in np.linspace(freq_min, freq_max, n_freq)])
     return prop, Omega, float(freq_min), float(freq_max)
 
@@ -210,7 +224,8 @@ def run_one(cfg, xs, ys, loss_type='cosine',
             depth_override=None, lambda_caps=LAMBDA_ETA, n_modes=N_MODES,
             n_act_per_side=N_ACT_PER_SIDE, freq_min=None, freq_max=None,
             n_freq=N_FREQ, hos_M=None, iters_scale=1.0, surface_tension=0.0,
-            renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
+            renderer='splat', nx=NX, ny=NY, actuator_width=0.05,
+            Lx=LX, Ly=LY):
     depth = depth_override if depth_override is not None else cfg.depth
     caps_str = "ON" if lambda_caps > 0 else "OFF"
     forward_label = f"HOS(M={hos_M})" if hos_M else "linear"
@@ -229,6 +244,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
         freq_min=fmin, freq_max=fmax, n_freq=n_freq,
         surface_tension=surface_tension,
         nx=nx, ny=ny, actuator_width=actuator_width,
+        Lx=Lx, Ly=Ly,
     )
     n_act, n_freq = prop.n_act, len(Omega)
     target = cfg.make(xs, ys).astype(np.float32)
@@ -335,7 +351,7 @@ def run_one(cfg, xs, ys, loss_type='cosine',
     # Apparatus config — JSON-serializable, sufficient for the export script
     # in notebooks/export_3d_animation.py to rebuild the apparatus.
     apparatus_config = dict(
-        Lx=LX, depth=depth, damping=DAMPING,
+        Lx=Lx, Ly=Ly, depth=depth, damping=DAMPING,
         n_modes=n_modes, n_act_per_side=n_act_per_side,
         actuator_width=actuator_width,  # configurable (default 0.05m = 5cm)
         nx=nx, ny=ny,
@@ -357,7 +373,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
          freq_min=None, freq_max=None, n_freq=N_FREQ,
          hos_M=None, iters_scale=1.0, targets_filter=None,
          lambda_override=None, surface_tension=0.0,
-         renderer='splat', nx=NX, ny=NY, actuator_width=0.05):
+         renderer='splat', nx=NX, ny=NY, actuator_width=0.05,
+         Lx=LX, Ly=LY):
     if lambda_override is not None:
         lambda_caps = lambda_override
     else:
@@ -388,6 +405,11 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         parts.append(f"g{nx}x{ny}")
     if actuator_width != 0.05:
         parts.append(f"σ{int(round(actuator_width*1000))}mm")
+    if Lx != LX or Ly != LY:
+        if Lx == Ly:
+            parts.append(f"L{Lx:g}m")
+        else:
+            parts.append(f"Lx{Lx:g}_Ly{Ly:g}m")
     tag = "_".join(parts)
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -409,8 +431,8 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
         print(f"Depth: {depth_override}m (overriding per-target defaults)")
     print(f"Output: {out_dir}\n", flush=True)
 
-    xs = np.linspace(0, LX, nx)
-    ys = np.linspace(0, LY, ny)
+    xs = np.linspace(0, Lx, nx)
+    ys = np.linspace(0, Ly, ny)
 
     targets_to_run = TARGETS
     if targets_filter is not None:
@@ -437,6 +459,7 @@ def main(loss_type='cosine', depth_override=None, no_caps=False,
             renderer=renderer,
             nx=nx, ny=ny,
             actuator_width=actuator_width,
+            Lx=Lx, Ly=Ly,
         )
         target  = result['target']
         I_show  = result['I_show']
@@ -556,7 +579,21 @@ if __name__ == "__main__":
                              "as exp(-σ²·k²/2), so larger σ suppresses higher-k modes. "
                              "Use ~0.005 (5 mm) when probing high-k modes (e.g., shallow-"
                              "tank diagnostics).")
+    parser.add_argument('--Lx', type=float, default=LX,
+                        help=f"Tank width in x (m, default {LX}). Sets the dimensionless "
+                             "geometry ratio L/throw that determines the basis size "
+                             "needed to address the useful caustic-forming mode range.")
+    parser.add_argument('--Ly', type=float, default=LY,
+                        help=f"Tank width in y (m, default {LY}). For a square tank, "
+                             "set Lx=Ly.")
+    parser.add_argument('--L', type=float, default=None,
+                        help="Shorthand: set both --Lx and --Ly to the same value. "
+                             "Overrides --Lx/--Ly if specified.")
     args = parser.parse_args()
+    # --L shorthand overrides --Lx/--Ly
+    if args.L is not None:
+        args.Lx = args.L
+        args.Ly = args.L
     main(loss_type=args.loss, depth_override=args.depth, no_caps=args.no_caps,
          n_modes=args.n_modes, n_act_per_side=args.n_act_per_side,
          freq_min=args.freq_min, freq_max=args.freq_max, n_freq=args.n_freq,
@@ -565,4 +602,5 @@ if __name__ == "__main__":
          surface_tension=args.surface_tension,
          renderer=args.renderer,
          nx=args.nx, ny=args.ny,
-         actuator_width=args.actuator_width)
+         actuator_width=args.actuator_width,
+         Lx=args.Lx, Ly=args.Ly)
