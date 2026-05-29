@@ -165,6 +165,14 @@ TARGETS = [
         stages=STAGES_IMAGE,
         n_temporal=5, sigma_temporal=0.033,
     ),
+    TargetConfig(
+        name="anna",
+        make=make_image_loader("ANNA.jpg"),
+        depth=5.0,                              # portrait, same regime as head
+        t_eval=1.0,
+        stages=STAGES_IMAGE,
+        n_temporal=5, sigma_temporal=0.033,
+    ),
 ]
 
 
